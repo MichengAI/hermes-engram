@@ -1,0 +1,4 @@
+name: engram
+version: 0.1.0
+description: "Engram 记忆 provider：按项目只读召回 Engram 记忆，带界面召回提示，IM 渠道默认不注入。"
+author: "YUJIYU"
