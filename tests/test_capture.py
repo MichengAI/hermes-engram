@@ -64,6 +64,12 @@ def _flush(provider):
     provider._join_writer(timeout=10)
 
 
+def _dispatch(provider, goal):
+    """模拟宿主真实派发 observer，合法完成路径必须有来源。"""
+    provider.on_post_tool_call(tool_name="delegate_task", session_id=provider._session_id,
+                              args={"tasks": [{"goal": goal}]}, result={"status": "dispatched"})
+
+
 # ---- 来源回合与首次项目登记 ----
 
 def test_host_delayed_sync_cannot_borrow_later_project(tmp_path, env):
@@ -316,7 +322,8 @@ def test_rejected_turn_blocks_capture_and_default_tools_then_recovers(tmp_path, 
         assert env("mem_session_summary") == []
         # 历史归属保留，但只有下一次合法解析后才恢复权限（即使召回无新正文）。
         p.prefetch("继续检查完整的兼容测试并说明结果", session_id="s1")
-        p.on_delegation("调查", body)
+        _dispatch(p, "恢复后新调查")
+        p.on_delegation("恢复后新调查", body)
         p.sync_turn("继续检查完整的兼容测试并说明结果", "回答")
         _flush(p)
         assert len(env("mem_capture_passive")) == 1
@@ -359,6 +366,7 @@ def test_queued_writes_keep_confirmed_project_when_next_turn_changes(tmp_path, e
         monkeypatch.setattr(p, "_enqueue", jobs.append)
         p.sync_turn("请检查完整的兼容测试并说明结果", "回答")
         p.on_post_tool_call(tool_name="terminal", session_id="s1", result="x" * 100)
+        _dispatch(p, "t")
         p.on_delegation("t", "## Key Learnings:\n1. Queued completion remains scoped to its confirmed project.")
         p.on_session_switch("s1", parent_session_id="s1", reason="compression")
         p.sync_turn("继续", "回答", messages=[_formal_summary("Queued formal summary.")])
@@ -680,6 +688,7 @@ def test_nested_json_tool_body_and_bounded_queue(tmp_path, env, monkeypatch):
         body = "## Key Learnings:\n1. Nested JSON contains real multiline output. <private>SECRET</private>\n" + "大" * 40000
         p.on_post_tool_call(tool_name="terminal", session_id="s1", result=json.dumps({
             "result": json.dumps({"output": body, "exit_code": 0}), "metadata": "ignored"}))
+        _dispatch(p, "t")
         p.on_delegation("t", body)
         assert len(jobs) == 2
         for job in jobs:
@@ -700,7 +709,7 @@ def test_background_delegation_completion_with_registered_hook(tmp_path, env):
     try:
         p.prefetch("看看兼容测试", session_id="s1")
         p._tool_capture_hook_registered = True
-        p.on_post_tool_call(tool_name="delegate_task", session_id="s1", result=json.dumps({
+        p.on_post_tool_call(tool_name="delegate_task", session_id="s1", args={"tasks": [{"goal": "调查"}]}, result=json.dumps({
             "status": "dispatched", "mode": "background", "count": 1,
             "delegation_id": "d1", "goals": ["调查"], "note": "Background task accepted",
         }))
@@ -721,7 +730,7 @@ def test_delegation_same_body_deduplicated_not_other_completion(tmp_path, env, t
         p.prefetch("看看兼容测试", session_id="s1")
         p._tool_capture_hook_registered = True
         body = "## Key Learnings:\n1. Identical synchronous completion is captured only once per session and project."
-        callbacks = [lambda: p.on_post_tool_call(tool_name="delegate_task", session_id="s1", result=body),
+        callbacks = [lambda: p.on_post_tool_call(tool_name="delegate_task", session_id="s1", args={"tasks": [{"goal": "t"}]}, result=body),
                      lambda: p.on_delegation("t", body)]
         for call in callbacks if tool_first else reversed(callbacks):
             call()
@@ -738,6 +747,7 @@ def test_delegation_result_passively_captured(tmp_path, env):
     p = _make(tmp_path)
     try:
         p.prefetch("看看兼容测试", session_id="s1")
+        _dispatch(p, "调查一下")
         p.on_delegation("调查一下", "结论...\n## Key Learnings:\n1. 第一条", child_session_id="c1")
         _flush(p)
         cap = env("mem_capture_passive")

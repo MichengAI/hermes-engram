@@ -1,12 +1,31 @@
-# hermes-engram
+<p align="center">
+  <img src="assets/branding/hermes-engram-banner.png" alt="Hermes Engram：项目记忆、可靠存取与会话恢复" width="100%">
+</p>
 
-把 [Engram](https://github.com/Gentleman-Programming/engram) 接成 Hermes Agent 原生的 **memory provider**：每轮对话前按项目自动召回 Engram 记忆，界面上显示召回提示。参考官方 [Pi adapter](https://github.com/Gentleman-Programming/engram/tree/main/plugin/pi) 的输入过滤、private 脱敏、工具结果被动捕获及压缩摘要归档，不安装 Pi、不迁移到 HTTP。
+<div align="center">
+
+# Hermes Engram
+
+**让项目记忆，跟得上每一轮对话。**
+
+[![MIT](https://img.shields.io/badge/License-MIT-06b6d4.svg)](LICENSE)
+[![Hermes Agent Plugin](https://img.shields.io/badge/Hermes%20Agent-Memory%20Plugin-0f766e.svg)](https://github.com/NousResearch/hermes-agent)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab.svg?logo=python&logoColor=white)](pyproject.toml)
+[![Engram](https://img.shields.io/badge/Engram-Project%20Memory-8b5cf6.svg)](https://github.com/Gentleman-Programming/engram)
+
+[MIT 开源协议](LICENSE)
+
+</div>
+
+> 社区维护的 Hermes Agent 插件，不是 Hermes 或 Engram 官方产品。
+
+把 [Engram](https://github.com/Gentleman-Programming/engram) 接成 Hermes Agent 原生的 **memory provider**：每轮对话前按项目自动召回 Engram 记忆，界面上显示召回提示。参考官方 [Pi adapter](https://github.com/Gentleman-Programming/engram/tree/main/plugin/pi) 的输入过滤、private 脱敏、工具结果被动捕获及压缩摘要归档，不安装 Pi；默认仍使用 MCP，可选启用自管本机 HTTP 增强。
 
 ```text
 🧠 Engram·dsh-codex-ui — recalled 5 memories
 ```
 
-不用单独配置 `mcp_servers.engram`：插件自己常驻一个 `engram mcp` 子进程，读写都走它，也提供 `engram_*` 工具给模型主动调用。
+不用单独配置 `mcp_servers.engram`：插件自己常驻一个 `engram mcp` 子进程；原生增强开启后，指定写入与恢复走插件自管回环服务，召回仍走 MCP，也提供 `engram_*` 工具给模型主动调用。
 
 ## 钩子对照（参考 Engram 官方 Codex / Pi 插件）
 
@@ -20,9 +39,9 @@
 | Pi `session_compact` | `on_session_switch(reason="compression")` + 后续 `sync_turn(messages=...)` | 按压缩时项目归档 Hermes 正式摘要；`on_pre_compress()` 只重置召回，不再把对话摘录冒充正式摘要 |
 | `SessionEnd` | `on_session_end()` | `mem_session_end` 关闭本会话注册过的 Engram 会话 |
 
-Hermes 压缩上下文会换 session_id（`on_session_switch(reset=False)`），插件沿用同一个 Engram 会话；`/new` 会先关闭旧会话，再在新会话里重新注册。
+Hermes 压缩边界只在 `reason="compression"` 时沿用 Engram 会话与摘要去重；普通分支使用独立身份，`/new` 重置，`/undo` 撤销旧来源证明与在途召回。会话结束先撤销当前权限，后台关闭等待在途注册完成。
 
-同 id 原地压缩也支持。归档前必须观察到 `reason="compression"`，并在后续完成回合的 `messages` 中找到宿主的正式摘要前缀/结束标记；只取摘要正文，去掉 handoff 提示，不生成替代摘要。
+同 id 原地压缩也支持。归档前必须观察到 `reason="compression"`，并在后续完成回合或会话结束的 `messages` 中找到宿主的正式摘要前缀/结束标记；只取摘要正文，去掉 handoff 提示，不生成替代摘要。
 
 ### 输入与隐私
 
@@ -54,7 +73,7 @@ Hermes 压缩上下文会换 session_id（`on_session_switch(reset=False)`），
 - **项目判定**：点名唯一项目 > 会话工作目录绑定 > 本会话沿用。点名多个、写了不存在的项目、判断不了时一律跳过，**绝不跨项目读写**。
 - **本轮归属与追问历史分离**：每次 `prefetch` 先撤销本轮确认；多项目、未知项目、项目解析异常或空输入不会继承上轮写权限。提问记录、工具/委派被动捕获和省略 `project` 的主动工具只使用本轮已确认项目；拒绝轮的压缩也不能借历史项目归档。历史项目仍保留，下一次合法追问重新解析后可恢复（即使没有新召回正文）。显式工具 `project` 仍须属于已知项目，不自动建项目；`engram_get` / `engram_judge` 按显式记录/判断 id 工作，不依赖默认项目。
 - **来源同步绑定**：`prefetch` 保存脱敏正文哈希与当时项目判定（包括拒绝）。宿主延迟执行 `sync_turn` 时只匹配来源记录，不读取最新项目；来源缺失、正文转换不一致或同文判定冲突时跳过。`on_turn_start` 撤销上一轮权限并阻止陈旧召回发布；没有回合 ID 的同文重复保守拒绝。最多保留 2048 个来源键，达到容量后停止本会话提问自动保存，不淘汰拒绝记录重新授权。
-- **后台归属快照**：provider 收到任务后固定项目；后台委派从工具参数 `tasks[].goal` 记录派发时会话/项目，完成通知按该来源匹配。冲突、容量耗尽或 `/new` 后的旧任务不写；缺少派发证据的旧宿主路径仅保留现有完成回调能力，不承诺恢复准确回合。正式摘要保留压缩时已确认的归属。
+- **后台归属快照**：provider 收到任务后固定项目；后台委派从工具参数 `tasks[].goal` 记录派发时会话/项目，完成通知按该来源匹配。冲突、容量耗尽或 `/new` 后的旧任务不写；缺少派发证据的完成通知一律跳过。同步路径即使完成回调先于 observer 到达，工具最终正文仍会被捕获；不借当前项目补猜来源。正式摘要保留压缩时已确认的归属。
 - **首次项目登记**：`auto_create_projects=true` 时，未绑定目录只在真实会话 cwd 位于 Git 仓库、允许 primary/本机写入且没有未知/多项目点名时初始化。通过 `git rev-parse` 确认根目录，调用 `mem_session_start(id, directory)`，采用 Engram canonical 项目名并刷新目录绑定表核对。兼容本机 Engram 3.0.0，不依赖其不支持的 `mem_current_project(cwd)` 参数。普通目录、父目录子仓库扫描、用户主目录与后端进程 cwd 不触发首次登记；这是比官方普通目录名回退更严格的边界。Engram 可能在 `.git` 的共享元数据内创建私有项目身份文件，Git worktree 复用该身份。
 - **已有项目会话注册**：点名项目必须已有，且会话目录绑定与 Engram 注册应答一致才挂会话；不会根据任意未知文本创建项目。
 - **没有确认归属的会话**：只读召回照常；`engram_save` 等工具改用显式 `project`、不挂会话；提问记录和被动捕获直接跳过（Engram 在缺会话时会按进程目录猜项目）。
@@ -83,6 +102,25 @@ hermes memory status
 ```
 
 切换后重启 Hermes（桌面端 / 网关）才会生效。不需要再配 `mcp_servers.engram`；如果还留着，会和 `engram_*` 工具重复。
+
+### 可选原生增强
+
+`plugins.engram.native_http=true` 时，插件用指定 Engram 可执行文件启动**自己管理的回环 HTTP 子进程**（随机端口、同一数据目录、关闭云同步）；不连接任意远端 URL，不停止用户已有服务。默认值为 `false`，MCP-only 用户不受影响。
+
+- **恢复身份**：探测 `/health` 的 `root_session_resume`；支持时采用服务端确认的 continuation。旧核心使用经过确认的本地续会话，不冒充服务端恢复。
+- **卫星会话**：跨项目写入先检查 `isolated_session_registration`，注册 `project_owned` 隔离会话；缺少能力直接拒绝，不挂当前目录。
+- **保存结果确认**：写入前探测正式 `/observations/save-result` 协议，冻结一次 `operation_id` 与脱敏正文。响应丢失后只做只读查询，不重新 POST。结果不确定时返回 `outcome=unknown` 与操作 ID，使用 `engram_recover_save` 查询。
+- **压缩恢复**：下一轮在召回区输出一次归档状态；增强模式可读取 `/context/compaction`。历史上下文不是新指令，不修改系统提示缓存。
+
+**版本边界：Engram 3.0.0 不声明根会话恢复；3.2.1 已声明根恢复与隔离注册，但未提供当前官方 main 的保存结果查询端点。原生可靠保存需要实际提供该端点的核心，不能只看版本号。旧核心会在写入前明确拒绝，不会静默绕过确认。**
+
+`persist_sessions=true` 默认在当前 `$HERMES_HOME/plugins-state/engram.sqlite3` 保存已确认的项目/会话身份，按 Engram 数据目录隔离；不保存提问或记忆正文，恢复仍需服务端再次确认。只读/禁写渠道不创建该日志。
+
+```powershell
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+hermes config set plugins.engram.native_http true
+```
 
 ### 只读模式
 
@@ -114,7 +152,9 @@ hermes config set memory.provider holographic
 | `prompt_min_chars` | `10` | 脱敏后的提问必须超过此字符数才记录 |
 | `capture_tools` | `true` | 通过真实 `post_tool_call` 被动捕获非记忆工具结果；依赖宿主加载器提供 hook 注册 |
 | `capture_delegation` | `true` | 捕获子代理完成正文（包括默认后台委派）；同步工具重复正文按会话/项目去重 |
-| `compaction_summary` | `true` | 完成回合同步时归档正式压缩摘要（`mem_session_summary`），不是压缩前摘录 |
+| `compaction_summary` | `true` | 完成回合或结束时归档正式摘要，不是压缩前摘录 |
+| `native_http` | `false` | 自管回环服务，能力检查后启用恢复、卫星会话、保存结果查询 |
+| `persist_sessions` | `true` | 当前 profile 中持久化已确认会话身份，不保存正文 |
 | `tools` | `true` | 注册 `engram_*` 工具并注入记忆协议 |
 | `max_bytes` | `6000` | 单轮注入总字节上限（UTF-8），含记忆协议 |
 | `context_bytes` | `3000` | 近期上下文字节上限 |
@@ -133,6 +173,8 @@ engram/              # 插件本体，安装时整个复制到 $HERMES_HOME/plug
   capture.py         # 输入识别、private 脱敏、正式摘要提取、会话 id、记忆协议、工具 schema
   recall.py          # 纯函数：项目判定、中文二元组检索词、字节截断、结果格式化
   mcp_client.py      # 常驻 engram mcp 子进程的极简 MCP stdio 客户端（懒启动、超时即重启）
+  native_runtime.py  # 可选原生协议：自管 HTTP、能力检查、operation_id 只读恢复
+  session_journal.py # profile/数据目录隔离的已确认会话身份日志
   plugin.yaml
 scripts/
   install.py         # 安装到 $HERMES_HOME/plugins/engram/
@@ -157,6 +199,9 @@ uv run --no-project --python $py --with pytest python -m pytest -q
 
 # 端到端·写入：在 Hermes scratch 下创建临时 HERMES_HOME / ENGRAM_DATA_DIR，结束后删除
 & $py scripts\e2e_smoke.py --engram D:\Tools\engram\engram.exe --cwd D:\Repository\hermes-plugins\hermes-engram --write
+
+# 原生增强：传入已核对、带保存结果查询端点的 Engram，不替换本机安装
+& $py scripts\e2e_native.py --engram D:\path\to\engram.exe
 ```
 
 `--write` 使用真实 Hermes provider 加载器、真实工具 observer 发射函数、真实委派 memory 通知函数及真实 `engram mcp`。夹具采用宿主真实 `delegate_task` 同步 JSON 包装和后台 dispatched/完成路径，最后只读回临时 SQLite，分别断言同步重复正文、仅工具 JSON 正文、后台完成正文各落库一次，并核实项目/会话归属、private 脱敏、提问过滤、正式摘要单次归档及会话关闭。摘要测试夹具采用宿主正式标记格式，**没有请求在线模型，不宣称验证了 LLM 生成质量或实际子代理调度**。pytest 覆盖真实加载器/MemoryManager 集成及明确拒绝、超时状态；假 MCP 只确认传输，不伪报 extracted/saved 数量，真实提取落库由隔离库 e2e 验证。
@@ -168,7 +213,7 @@ uv run --no-project --python $py --with pytest python -m pytest -q
 - 外部 memory provider 同一时间只能启用一个，启用 Engram 会停用 holographic。
 - 召回内容在聊天界面不显示正文，只显示召回提示；完整内容在发给模型的 `api_content` 里。
 - 被动捕获依赖 Engram 的 `## Key Learnings:` 提取规则：实测中文条目要用空格分词才会被提取，整句不带空格的中文会被忽略。记忆协议里已提示模型这样写。
-- Hermes memory provider 没有 `on_post_compress(summary=...)` 生命周期参数；`on_session_switch` 只通知 reason/id。归档因此延后到携带正式摘要的完成回合同步，若回合被中断、宿主不传 messages、没有正式标记或进程提前退出，本次不会自动归档；不承诺压缩前 durable checkpoint。
+- Hermes memory provider 没有 `on_post_compress(summary=...)` 生命周期参数；`on_session_switch` 只通知 reason/id。归档由携带正式摘要的完成回合同步或会话结束触发；宿主不传 messages、没有正式标记或进程强制退出时仍可能漏归档；不承诺压缩前 durable checkpoint。
 - Hermes 未提供 Pi 的输入 `source="extension"` provenance；只能过滤已核实的内部标记/常量与机器人作者，未标记的扩展输入无法可靠识别，不能声称全部合成输入已跳过。
-- 当前摘要提取依赖宿主摘要常量和 carrier 标记格式；不支持未确认的旧格式或 provider-native opaque compaction。归档状态没有额外 UI 提示，供代码检查，不修改系统提示缓存。
+- 当前摘要提取依赖宿主摘要常量和 carrier 标记格式；不支持未确认的旧格式或 provider-native opaque compaction。归档状态在压缩后的下一次召回中提示一次，不修改系统提示缓存。
 - Hermes 先读取工具 schema 再初始化 provider，因此 `engram_*` 工具在 IM 渠道也会出现在工具列表里，但写工具调用会被拒绝。

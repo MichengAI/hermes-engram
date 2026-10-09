@@ -8,7 +8,9 @@ from engram.capture import WRITE_TOOL_SCHEMAS, READ_TOOL_SCHEMAS, build_compacti
 def test_session_id_is_stable_safe_and_per_project():
     a = engram_session_id("20261009_085122_d40732", "dsh-codex-ui")
     assert a == "hermes-20261009_085122_d40732-dsh-codex-ui"
-    assert engram_session_id("s 1/x", "p:q") == "hermes-s_1_x-p_q"
+    unsafe = engram_session_id("s 1/x", "p:q")
+    assert unsafe.startswith("hermes-s_1_x-p_q-") and unsafe == engram_session_id("s 1/x", "p:q")
+    assert unsafe != engram_session_id("s_1_x", "p_q")
     assert engram_session_id("s1", "a") != engram_session_id("s1", "b")
     assert len(engram_session_id("s" * 300, "p")) <= 120
 

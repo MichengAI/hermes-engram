@@ -136,7 +136,7 @@ def main() -> int:
                     tool_call_id="e2e-tool-2", result=json.dumps({"results": [{"task_index": 0, "status": "completed",
                     "summary": tool_body, "duration_seconds": 1.0}], "total_duration_seconds": 1.0}))
                 # 默认后台路径的工具返回只含 dispatched；完成正文只能走 memory.on_delegation。
-                _emit_post_tool_call_hook(function_name="delegate_task", function_args={}, session_id="e2e-1",
+                _emit_post_tool_call_hook(function_name="delegate_task", function_args={"tasks": [{"goal": "verify background capture"}]}, session_id="e2e-1",
                     tool_call_id="e2e-tool-3", result=json.dumps({"status": "dispatched", "mode": "background",
                     "count": 1, "delegation_id": "e2e-bg", "goals": ["verify background capture"], "note": "accepted"}))
                 async_body = "## Key Learnings:\n1. E2E asynchronous completion capture survives registered tool hooks and persists only completed summaries. <private>E2E_SECRET</private>"
@@ -273,6 +273,10 @@ def _seed_project(engram: str, data_dir: str, cwd: str) -> None:
         if "id" in item:
             proc.stdout.readline()
     proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any, Dict, Iterator, List
@@ -86,7 +87,12 @@ def engram_session_id(hermes_session_id: str, project: str) -> str:
     同一个 Hermes 会话可能先后涉及多个项目，按项目拆开，保证每个 Engram 会话只属于一个项目。
     """
     raw = f"hermes-{hermes_session_id}-{project}"
-    return _SAFE_ID_RE.sub("_", raw)[:120]
+    safe = _SAFE_ID_RE.sub("_", raw)
+    # 普通旧 ID 保持兼容；替换、截断及分隔歧义必须由原始二元身份消歧。
+    if safe == raw and len(raw) <= 120 and "-" not in hermes_session_id:
+        return raw
+    digest = hashlib.sha256(json.dumps([hermes_session_id, project], ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
+    return safe[:95] + "-" + digest
 
 
 def _text_of(content: Any) -> str:
@@ -171,6 +177,8 @@ def _schema(name: str, description: str, properties: Dict[str, Any], required: L
 _PROJECT_PROP = {"type": "string", "description": "Engram 项目名；省略时使用当前会话已确定的项目。"}
 
 READ_TOOL_SCHEMAS = [
+    _schema("engram_recover_save", "保存结果不确定时，只读查询原 operation_id；不会重新派发保存。需要 native_http。",
+            {"operation_id": {"type": "string", "description": "原生保存返回的 UUID 操作标识"}}, ["operation_id"]),
     _schema("engram_search", "在 Engram 中按项目检索历史决定、bug 修复、约定等记忆。自动召回不够时使用。",
             {"query": {"type": "string", "description": "关键词或自然语言"},
              "project": _PROJECT_PROP,

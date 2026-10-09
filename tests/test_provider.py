@@ -208,6 +208,7 @@ def test_works_through_hermes_memory_manager(tmp_path):
         saved = json.loads(manager.handle_tool_call("engram_save", {"title": "t", "content": "c"}))
         assert saved["id"] > 0
         manager.sync_all("请检查完整的兼容测试并说明结果", "回答", session_id="s1")
+        assert manager.flush_pending(timeout=10)  # 结束边界之前完成宿主上游同步队列
         manager.on_session_end([])
     finally:
         manager.shutdown_all()
