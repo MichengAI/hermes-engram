@@ -64,6 +64,183 @@ def _flush(provider):
     provider._join_writer(timeout=10)
 
 
+# ---- 来源回合与首次项目登记 ----
+
+def test_host_delayed_sync_cannot_borrow_later_project(tmp_path, env):
+    """真实宿主队列尚未执行时，下一轮确认不能重新授权旧拒绝正文。"""
+    import threading
+    from agent.memory_manager import MemoryManager
+    p = _make(tmp_path)
+    manager = MemoryManager()
+    manager.add_provider(p)
+    entered, release = threading.Event(), threading.Event()
+    original = p.sync_turn
+    def delayed(user, assistant, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        original(user, assistant, **kwargs)
+    p.sync_turn = delayed
+    rejected = "project: unknown-project 请检查完整架构并说明结果"
+    try:
+        p.prefetch("renren-drama 检查完整架构", session_id="s1")
+        p.prefetch(rejected, session_id="s1")
+        manager.sync_all(rejected, "回答", session_id="s1")
+        assert entered.wait(5)
+        p.prefetch("继续检查完整架构和测试", session_id="s1")
+        release.set()
+        assert manager.flush_pending(timeout=10)
+        _flush(p)
+        assert env("mem_save_prompt") == []
+    finally:
+        release.set()
+        manager.shutdown_all()
+
+
+def test_delayed_valid_prompt_keeps_source_project(tmp_path, env):
+    p = _make(tmp_path)
+    first = "renren-drama 检查完整架构和测试"
+    try:
+        p.prefetch(first, session_id="s1")
+        p.prefetch("dsh-codex-ui 检查完整架构和测试", session_id="s1")
+        p.sync_turn(first, "回答", session_id="s1")
+        _flush(p)
+        assert env("mem_save_prompt")[-1]["arguments"]["session_id"] == "hermes-s1-renren-drama"
+    finally:
+        p.shutdown()
+
+
+def test_repeated_text_with_conflicting_decisions_is_not_reauthorized(tmp_path, env, monkeypatch):
+    p = _make(tmp_path)
+    text = "请检查完整架构和所有测试结果"
+    try:
+        monkeypatch.setattr(p, "_session_cwd", lambda sid: "")
+        p.prefetch(text, session_id="s1")
+        p.prefetch("renren-drama 检查完整架构", session_id="s1")
+        p.prefetch(text, session_id="s1")
+        p.sync_turn(text, "回答", session_id="s1")
+        _flush(p)
+        assert env("mem_save_prompt") == []
+    finally:
+        p.shutdown()
+
+
+def test_turn_start_revokes_inflight_recall(tmp_path, env, monkeypatch):
+    import threading
+    p = _make(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    original = p._resolve_project
+    def delayed(*args):
+        value = original(*args)
+        entered.set()
+        assert release.wait(5)
+        return value
+    monkeypatch.setattr(p, "_resolve_project", delayed)
+    worker = threading.Thread(target=p.prefetch, args=("renren-drama 检查完整架构",))
+    try:
+        worker.start()
+        assert entered.wait(5)
+        p.on_turn_start(2, "继续")  # 宿主可能跳过这个 trivial 回合的 prefetch
+        release.set()
+        worker.join(5)
+        assert p._state("s1").confirmed_project is None
+    finally:
+        release.set()
+        worker.join(5)
+        p.shutdown()
+
+
+def test_async_delegation_uses_dispatch_project_after_switch(tmp_path, env):
+    p = _make(tmp_path)
+    body = "## Key Learnings:\n1. Background completion stays attached to the project that dispatched it."
+    try:
+        p.prefetch("renren-drama 检查完整架构")
+        p.on_post_tool_call(tool_name="delegate_task", session_id="s1", args={"tasks": [{"goal": "origin-task"}]},
+                            result={"status": "dispatched"})
+        p.prefetch("dsh-codex-ui 检查完整架构")
+        p.on_delegation("origin-task", body)
+        _flush(p)
+        assert env("mem_capture_passive")[0]["arguments"]["session_id"] == "hermes-s1-renren-drama"
+    finally:
+        p.shutdown()
+
+
+def test_repeated_turn_without_prefetch_cannot_reuse_old_proof(tmp_path, env):
+    p = _make(tmp_path)
+    text = "renren-drama 检查完整架构和所有测试结果"
+    try:
+        p.prefetch(text)
+        p.on_turn_start(2, text)  # 新轮没有可配对的 ID，宿主也可能跳过 prefetch
+        p.sync_turn(text, "回答")
+        _flush(p)
+        assert env("mem_save_prompt") == []
+    finally:
+        p.shutdown()
+
+
+def test_source_capacity_fails_closed(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        state = p._state("s1")
+        for index in range(2049):
+            p._record_source(state, f"source-{index}", "renren-drama")
+        p.prefetch("renren-drama 检查完整架构", session_id="s1")
+        p.sync_turn("renren-drama 检查完整架构", "回答", session_id="s1")
+        _flush(p)
+        assert state.source_limit_reached and len(state.prompt_sources) == 2048
+        assert env("mem_save_prompt") == []
+    finally:
+        p.shutdown()
+
+
+def test_unobserved_sync_is_not_authorized(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("renren-drama 检查完整架构")
+        p.sync_turn("未经来源确认的完整用户正文", "回答")
+        _flush(p)
+        assert env("mem_save_prompt") == []
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_fresh_git_project_registration_uses_engram_identity(tmp_path, env, monkeypatch, blocked):
+    import subprocess
+    repo = tmp_path / "local-folder"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    monkeypatch.setenv("FAKE_SESSION_PROJECT", "canonical-remote-name")
+    p = _make(tmp_path, rows={"s1": str(repo)}, auto_capture=not blocked)
+    try:
+        out = p.prefetch("检查完整项目架构和所有测试", session_id="s1")
+        if blocked:
+            assert env("mem_session_start") == [] and out == ""
+        else:
+            assert "项目=canonical-remote-name" in out
+            starts = env("mem_session_start")
+            assert len(starts) == 1
+            from pathlib import Path
+            assert Path(starts[0]["arguments"]["directory"]) == repo
+            p.sync_turn("检查完整项目架构和所有测试", "回答", session_id="s1")
+            _flush(p)
+            assert env("mem_save_prompt")[0]["arguments"]["session_id"] == starts[0]["arguments"]["id"]
+    finally:
+        p.shutdown()
+
+
+def test_unknown_text_does_not_create_git_project(tmp_path, env, monkeypatch):
+    import subprocess
+    repo = tmp_path / "fresh"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    p = _make(tmp_path, rows={"s1": str(repo)})
+    try:
+        assert p.prefetch("project: invented-name 请检查完整架构", session_id="s1") == ""
+        assert env("mem_session_start") == []
+    finally:
+        p.shutdown()
+
+
 # ---- SessionStart：注册会话 + 注入协议 ----
 
 def test_first_recall_registers_session_and_injects_protocol(tmp_path, env):
@@ -111,19 +288,184 @@ def test_no_directory_binding_uses_explicit_project_without_session(tmp_path, en
         p.shutdown()
 
 
+@pytest.mark.parametrize("query", [
+    "比较 renren-drama 和 dsh-codex-ui 项目的完整架构",
+    "project: unknown-project 请检查完整架构并说明结果",
+])
+def test_rejected_turn_blocks_capture_and_default_tools_then_recovers(tmp_path, env, monkeypatch, query):
+    p = _make(tmp_path)
+    body = "## Key Learnings:\n1. Rejected turn must never leak into the previously confirmed project."
+    try:
+        p.prefetch("renren-drama 兼容测试", session_id="s1")
+        # 已注册会话仍合法；撤掉 cwd 线索以证明恢复来自历史 sticky 而非目录回退。
+        monkeypatch.setattr(p, "_session_cwd", lambda sid: "")
+        assert p.prefetch(query, session_id="s1") == ""
+        p.on_post_tool_call(tool_name="terminal", session_id="s1", result=body)
+        p.on_delegation("调查", body)
+        p.sync_turn(query, "回答", session_id="s1")
+        _flush(p)
+        assert env("mem_capture_passive") == []
+        assert env("mem_save_prompt") == []
+        for tool, args in [("engram_save", {"title": "t", "content": "c"}),
+                           ("engram_session_summary", {"content": "c"}),
+                           ("engram_search", {"query": "架构"})]:
+            assert "error" in json.loads(p.handle_tool_call(tool, args))
+        p.on_session_switch("s1", parent_session_id="s1", reason="compression")
+        p.sync_turn("继续", "回答", messages=[_formal_summary("Rejected turn summary.")])
+        _flush(p)
+        assert env("mem_session_summary") == []
+        # 历史归属保留，但只有下一次合法解析后才恢复权限（即使召回无新正文）。
+        p.prefetch("继续检查完整的兼容测试并说明结果", session_id="s1")
+        p.on_delegation("调查", body)
+        p.sync_turn("继续检查完整的兼容测试并说明结果", "回答")
+        _flush(p)
+        assert len(env("mem_capture_passive")) == 1
+        assert len(env("mem_save_prompt")) == 1
+        assert env("mem_capture_passive")[0]["arguments"]["session_id"] == "hermes-s1-renren-drama"
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["transport", "parser", "empty"])
+def test_project_resolution_failure_revokes_turn_not_history(tmp_path, env, monkeypatch, failure):
+    from engram.mcp_client import McpError
+    p = _make(tmp_path)
+    try:
+        p.prefetch("renren-drama 兼容测试")
+        with monkeypatch.context() as m:
+            if failure != "empty":
+                def fail(*args, **kwargs):
+                    raise McpError("unavailable") if failure == "transport" else ValueError("invalid catalog")
+                m.setattr(p, "_get_catalog", fail)
+            assert p.prefetch("" if failure == "empty" else "请检查完整项目架构") == ""
+        p.on_delegation("t", "## Key Learnings:\n1. Failed project resolution cannot reuse an old confirmed session.")
+        p.sync_turn("请检查完整项目架构并说明结果", "回答")
+        _flush(p)
+        assert env("mem_capture_passive") == env("mem_save_prompt") == []
+        assert "error" in json.loads(p.handle_tool_call("engram_save", {"title": "t", "content": "c"}))
+        p.prefetch("继续检查完整项目架构并说明结果")
+        p.sync_turn("继续检查完整项目架构并说明结果", "回答")
+        _flush(p)
+        assert len(env("mem_save_prompt")) == 1
+    finally:
+        p.shutdown()
+
+
+def test_queued_writes_keep_confirmed_project_when_next_turn_changes(tmp_path, env, monkeypatch):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("请检查完整的兼容测试并说明结果")
+        jobs = []
+        monkeypatch.setattr(p, "_enqueue", jobs.append)
+        p.sync_turn("请检查完整的兼容测试并说明结果", "回答")
+        p.on_post_tool_call(tool_name="terminal", session_id="s1", result="x" * 100)
+        p.on_delegation("t", "## Key Learnings:\n1. Queued completion remains scoped to its confirmed project.")
+        p.on_session_switch("s1", parent_session_id="s1", reason="compression")
+        p.sync_turn("继续", "回答", messages=[_formal_summary("Queued formal summary.")])
+        assert len(jobs) == 4
+        p.prefetch("dsh-codex-ui 架构")
+        p.prefetch("project: missing-project 请检查完整架构")
+        for job in jobs:
+            job()
+        for name in ("mem_save_prompt", "mem_capture_passive", "mem_session_summary"):
+            assert env(name)
+            assert all(c["arguments"]["session_id"] == "hermes-s1-renren-drama" for c in env(name))
+        assert env("mem_session_summary")[0]["arguments"]["project"] == "renren-drama"
+    finally:
+        p.shutdown()
+
+
 # ---- UserPromptSubmit：记录用户提问 ----
 
 def test_sync_turn_saves_prompt_in_background(tmp_path, env):
     p = _make(tmp_path)
     try:
-        p.prefetch("看看兼容测试", session_id="s1")
+        p.prefetch("请检查完整的兼容测试并说明结果", session_id="s1")
         started = time.monotonic()
-        p.sync_turn("看看兼容测试", "这是回答", session_id="s1")
+        p.sync_turn("请检查完整的兼容测试并说明结果", "这是回答", session_id="s1")
         assert time.monotonic() - started < 0.5  # 不阻塞
         _flush(p)
         prompts = env("mem_save_prompt")
         assert len(prompts) == 1
-        assert prompts[0]["arguments"] == {"content": "看看兼容测试", "session_id": "hermes-s1-renren-drama"}
+        assert prompts[0]["arguments"] == {"content": "请检查完整的兼容测试并说明结果", "session_id": "hermes-s1-renren-drama"}
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("text", [
+    "[System: continue the internal tool execution now]",
+    "[CONTEXT COMPACTION — REFERENCE ONLY] Historical summary here",
+    "[ASYNC DELEGATION] Internal delegated result is ready",
+    "Cronjob Response: scheduled internal follow-up",
+])
+def test_synthetic_prompt_is_not_saved(tmp_path, env, text):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.sync_turn(text, "回答", session_id="s1")
+        _flush(p)
+        assert env("mem_save_prompt") == []
+    finally:
+        p.shutdown()
+
+
+def test_host_plain_continuation_nudge_is_not_saved(tmp_path, env):
+    from agent.context_compressor import COMPRESSION_CONTINUATION_USER_CONTENT
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.sync_turn(COMPRESSION_CONTINUATION_USER_CONTENT, "回答")
+        _flush(p)
+        assert env("mem_save_prompt") == []
+    finally:
+        p.shutdown()
+
+
+def test_bot_authored_prompt_is_not_saved(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.sync_turn("This is an automated bot follow-up", "回答", turn_author={"id": "bot:alpha", "is_bot": True})
+        _flush(p)
+        assert env("mem_save_prompt") == []
+    finally:
+        p.shutdown()
+
+
+def test_private_query_not_sent_as_search_tokens(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("请检查架构 <private>supersecrettoken</private>", session_id="s1")
+        query = env("mem_search")[0]["arguments"]["query"]
+        assert "supersecrettoken" not in query
+    finally:
+        p.shutdown()
+
+
+def test_private_prompt_redacted_before_truncation(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        text = "public instructions " + "x" * 19960 + "<PRIVATE>" + "SECRET" * 100 + "</PRIVATE> tail"
+        p.prefetch(text, session_id="s1")
+        p.sync_turn(text,
+                    "回答", session_id="s1")
+        _flush(p)
+        content = env("mem_save_prompt")[0]["arguments"]["content"]
+        assert "SECRET" not in content and "[REDACTED]" in content
+    finally:
+        p.shutdown()
+
+
+def test_prompt_length_filter(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.prefetch("1234567890", session_id="s1")
+        p.sync_turn("1234567890", "回答", session_id="s1")
+        p.prefetch("12345678901", session_id="s1")
+        p.sync_turn("12345678901", "回答", session_id="s1")
+        _flush(p)
+        assert [c["arguments"]["content"] for c in env("mem_save_prompt")] == ["12345678901"]
     finally:
         p.shutdown()
 
@@ -226,6 +568,172 @@ def test_im_platform_no_tools_effect_and_no_writes(tmp_path, env):
 
 # ---- SubagentStop：被动捕获 ----
 
+def test_provider_loader_registers_working_post_tool_hook(tmp_path, env, monkeypatch):
+    import engram
+    from hermes_cli import plugins
+    from hermes_cli.lifecycle import invoke_hook
+    from plugins.memory import _load_provider_from_dir
+    from pathlib import Path
+
+    home = _home(tmp_path, {"s1": REPO})
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = plugins.PluginManager()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    from hermes_cli import config
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"plugins": {"engram": {
+        "command": [sys.executable, str(FAKE_SERVER)], "call_timeout": 3,
+    }}})
+    p = _load_provider_from_dir(Path(engram.__file__).parent)
+    assert p is not None
+    p.initialize("s1", hermes_home=str(home), platform="desktop", agent_context="primary")
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        assert manager.has_hook("post_tool_call")
+        invoke_hook("post_tool_call", tool_name="terminal", args={}, session_id="s1",
+                    tool_call_id="tool-1", result="## Key Learnings:\n1. A verified tool result with enough words to be passively captured.")
+        _flush(p)
+        cap = env("mem_capture_passive")
+        assert len(cap) == 1 and cap[0]["arguments"]["source"] == "terminal"
+        assert cap[0]["arguments"]["session_id"] == "hermes-s1-renren-drama"
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("name,sid,result", [
+    ("memory", "s1", "x" * 100),
+    ("engram_save", "s1", "x" * 100),
+    ("mcp__engram__mem_search", "s1", "x" * 100),
+    ("mem_context", "s1", "x" * 100),
+    ("terminal", "child", "x" * 100),
+    ("terminal", "", "x" * 100),
+    ("terminal", "s1", "x" * 50),
+    ("terminal", "s1", None),
+])
+def test_tool_capture_skips_memory_unrelated_sessions_and_small_results(tmp_path, env, name, sid, result):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.on_post_tool_call(tool_name=name, session_id=sid, result=result)
+        _flush(p)
+        assert env("mem_capture_passive") == []
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("cfg", [{"capture_tools": False}, {"auto_capture": False},
+                                 {"agent_context": "subagent"}, {"agent_context": "cron"},
+                                 {"platform": "weixin"}, {"rows": {"s1": "D:\\AI\\HermesData"}}])
+def test_tool_capture_preserves_write_boundaries(tmp_path, env, cfg):
+    p = _make(tmp_path, **cfg)
+    try:
+        p.prefetch("renren-drama 架构", session_id="s1")
+        p.on_post_tool_call(tool_name="terminal", session_id="s1", result="x" * 100)
+        _flush(p)
+        assert env("mem_capture_passive") == []
+    finally:
+        p.shutdown()
+
+
+def test_structured_tool_result_redacted_before_capture(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.on_post_tool_call(tool_name="web_extract", session_id="s1",
+                            result={"items": [{"text": "x" * 80 + "<PRIVATE>SECRET</PRIVATE>"}], "count": 1})
+        _flush(p)
+        content = env("mem_capture_passive")[0]["arguments"]["content"]
+        assert "SECRET" not in content and "[REDACTED]" in content
+        assert content == "x" * 80 + "[REDACTED]"
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("encode", [False, True])
+@pytest.mark.parametrize("tool_first", [False, True])
+def test_host_delegate_wrapper_captures_multiline_bodies_once(tmp_path, env, encode, tool_first):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        bodies = ["## Key Learnings:\n1. First verified synchronous delegation learning is a real multiline body.",
+                  "## Key Learnings:\n1. Second verified synchronous delegation learning is separate. <private>SECRET</private>"]
+        wrapped = {"results": [{"task_index": i, "status": "completed", "summary": body,
+                                "duration_seconds": 1.0} for i, body in enumerate(bodies)],
+                   "total_duration_seconds": 2.0}
+        result = json.dumps(wrapped) if encode else wrapped
+        callbacks = [lambda: p.on_post_tool_call(tool_name="delegate_task", session_id="s1", result=result),
+                     lambda: [p.on_delegation("t", body) for body in bodies]]
+        for call in callbacks if tool_first else reversed(callbacks):
+            call()
+        _flush(p)
+        contents = [c["arguments"]["content"] for c in env("mem_capture_passive")]
+        assert contents == [bodies[0], bodies[1].replace("<private>SECRET</private>", "[REDACTED]")]
+    finally:
+        p.shutdown()
+
+
+def test_nested_json_tool_body_and_bounded_queue(tmp_path, env, monkeypatch):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        jobs = []
+        monkeypatch.setattr(p, "_enqueue", jobs.append)
+        body = "## Key Learnings:\n1. Nested JSON contains real multiline output. <private>SECRET</private>\n" + "大" * 40000
+        p.on_post_tool_call(tool_name="terminal", session_id="s1", result=json.dumps({
+            "result": json.dumps({"output": body, "exit_code": 0}), "metadata": "ignored"}))
+        p.on_delegation("t", body)
+        assert len(jobs) == 2
+        for job in jobs:
+            strings = [cell.cell_contents for cell in job.__closure__ if isinstance(cell.cell_contents, str)]
+            assert all(len(s.encode("utf-8")) <= 30000 and "SECRET" not in s for s in strings)
+            job()
+        contents = [c["arguments"]["content"] for c in env("mem_capture_passive")]
+        assert len(contents) == 2
+        assert all(c.startswith("## Key Learnings:\n1.") and "[REDACTED]" in c for c in contents)
+    finally:
+        p.shutdown()
+
+
+def test_background_delegation_completion_with_registered_hook(tmp_path, env):
+    from types import SimpleNamespace
+    from tools.delegate_tool_results import _notify_memory_manager
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p._tool_capture_hook_registered = True
+        p.on_post_tool_call(tool_name="delegate_task", session_id="s1", result=json.dumps({
+            "status": "dispatched", "mode": "background", "count": 1,
+            "delegation_id": "d1", "goals": ["调查"], "note": "Background task accepted",
+        }))
+        body = "## Key Learnings:\n1. Background completion must survive a registered post tool hook."
+        _notify_memory_manager([{"task_index": 0, "summary": body}], [{"goal": "调查"}],
+                               {0: SimpleNamespace(session_id="c1")}, SimpleNamespace(_memory_manager=p))
+        _flush(p)
+        caps = env("mem_capture_passive")
+        assert [c["arguments"]["content"] for c in caps] == [body]
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("tool_first", [True, False])
+def test_delegation_same_body_deduplicated_not_other_completion(tmp_path, env, tool_first):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p._tool_capture_hook_registered = True
+        body = "## Key Learnings:\n1. Identical synchronous completion is captured only once per session and project."
+        callbacks = [lambda: p.on_post_tool_call(tool_name="delegate_task", session_id="s1", result=body),
+                     lambda: p.on_delegation("t", body)]
+        for call in callbacks if tool_first else reversed(callbacks):
+            call()
+        other = body + "\n2. Another background completion is not suppressed."
+        p.on_delegation("t", other)
+        _flush(p)
+        contents = [c["arguments"]["content"] for c in env("mem_capture_passive")]
+        assert contents == [body, other]
+    finally:
+        p.shutdown()
+
+
 def test_delegation_result_passively_captured(tmp_path, env):
     p = _make(tmp_path)
     try:
@@ -253,24 +761,135 @@ def test_delegation_without_session_is_skipped(tmp_path, env):
 
 # ---- 压缩：存总结 + 重新召回 ----
 
-def test_pre_compress_saves_checkpoint_summary_and_resets_recall(tmp_path, env):
+def _formal_summary(content):
+    from agent.context_compressor import SUMMARY_PREFIX, HISTORICAL_TASK_HEADING, _SUMMARY_END_MARKER
+    return {"role": "assistant", "_compressed_summary": True,
+            "content": f"{SUMMARY_PREFIX}\n\n{HISTORICAL_TASK_HEADING}\n{content}\n\n{_SUMMARY_END_MARKER}"}
+
+
+def test_completed_turn_archives_formal_compression_summary(tmp_path, env):
+    from agent.memory_manager import MemoryManager
+    p = _make(tmp_path, rows={"s1": REPO, "s2": REPO}, capture_prompts=False)
+    manager = MemoryManager()
+    manager.add_provider(p)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        manager.on_pre_compress([{"role": "user", "content": "原始提问"}])
+        manager.on_session_switch("s2", parent_session_id="s1", reset=False, reason="compression")
+        manager.sync_all("继续", "完成", session_id="s2", messages=[_formal_summary("Official generated summary <private>SECRET</private>" )])
+        assert manager.flush_pending(timeout=10)
+        _flush(p)
+        cap = env("mem_session_summary")
+        assert len(cap) == 1
+        assert cap[0]["arguments"] == {"content": "Official generated summary [REDACTED]",
+                                        "project": "renren-drama", "session_id": "hermes-s1-renren-drama"}
+    finally:
+        manager.shutdown_all()
+
+
+def test_formal_summary_deduplicated_across_compression_lineage(tmp_path, env):
+    p = _make(tmp_path, rows={"s1": REPO, "s2": REPO}, capture_prompts=False)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.on_session_switch("s2", parent_session_id="s1", reason="compression")
+        messages = [_formal_summary("The official summary is stable.")]
+        p.sync_turn("继续", "完成", session_id="s2", messages=messages)
+        p.sync_turn("继续", "完成", session_id="s2", messages=messages)
+        _flush(p)
+        p.on_session_switch("s2", parent_session_id="s2", reason="compression")
+        p.sync_turn("继续", "完成", session_id="s2", messages=messages)
+        _flush(p)
+        assert len(env("mem_session_summary")) == 1
+        assert list(p.compaction_status().values()) == ["saved"]
+    finally:
+        p.shutdown()
+
+
+def test_summary_rejection_records_failure_without_automatic_replay(tmp_path, env, monkeypatch):
+    monkeypatch.setenv("FAKE_SUMMARY_MODE", "error")
+    p = _make(tmp_path, capture_prompts=False)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.on_session_switch("s1", parent_session_id="s1", reason="compression")
+        messages = [_formal_summary("A summary whose archive is rejected.")]
+        p.sync_turn("继续", "完成", messages=messages)
+        _flush(p)
+        p.sync_turn("继续", "完成", messages=messages)
+        _flush(p)
+        assert list(p.compaction_status().values()) == ["failed"]
+        assert len(env("mem_session_summary")) == 1
+    finally:
+        p.shutdown()
+
+
+def test_summary_timeout_records_unknown_without_replay(tmp_path, env, monkeypatch):
+    monkeypatch.setenv("FAKE_SUMMARY_MODE", "hang")
+    p = _make(tmp_path, capture_prompts=False, write_timeout=0.2)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.on_session_switch("s1", parent_session_id="s1", reason="compression")
+        messages = [_formal_summary("A summary with uncertain transport outcome.")]
+        p.sync_turn("继续", "完成", messages=messages)
+        _flush(p)
+        p.sync_turn("继续", "完成", messages=messages)
+        _flush(p)
+        assert list(p.compaction_status().values()) == ["unknown"]
+        assert len(env("mem_session_summary")) == 1
+    finally:
+        p.shutdown()
+
+
+def test_summary_uses_project_at_compression_not_next_prompt(tmp_path, env):
+    p = _make(tmp_path, capture_prompts=False)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.on_session_switch("s1", parent_session_id="s1", reason="compression")
+        p.prefetch("dsh-codex-ui 架构", session_id="s1")
+        p.sync_turn("继续", "完成", messages=[_formal_summary("Previous project work summary.")])
+        _flush(p)
+        assert env("mem_session_summary")[0]["arguments"]["project"] == "renren-drama"
+    finally:
+        p.shutdown()
+
+
+@pytest.mark.parametrize("cfg", [{"compaction_summary": False}, {"auto_capture": False},
+                                 {"agent_context": "subagent"}, {"agent_context": "cron"},
+                                 {"platform": "weixin"}])
+def test_summary_preserves_write_boundaries(tmp_path, env, cfg):
+    p = _make(tmp_path, **cfg)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        p.on_session_switch("s1", parent_session_id="s1", reason="compression")
+        p.sync_turn("继续", "完成", messages=[_formal_summary("Official summary.")])
+        _flush(p)
+        assert env("mem_session_summary") == []
+    finally:
+        p.shutdown()
+
+
+def test_no_summary_without_confirmed_boundary_or_formal_carrier(tmp_path, env):
     p = _make(tmp_path)
     try:
         p.prefetch("看看兼容测试", session_id="s1")
-        messages = [
-            {"role": "user", "content": "看看兼容测试"},
-            {"role": "assistant", "content": "已经跑完兼容测试，全部通过。"},
-            {"role": "tool", "content": "很长的工具输出" * 100},
-            {"role": "user", "content": "再发布一下"},
-            {"role": "assistant", "content": "发布完成，版本 0.1.2。"},
-        ]
-        assert p.on_pre_compress(messages) == ""
+        p.sync_turn("继续", "完成", messages=[_formal_summary("No boundary yet.")])
+        p.on_session_switch("s1", parent_session_id="s1", reason="compression")
+        p.sync_turn("继续", "完成", messages=[{"role": "assistant", "content": "Ordinary answer"}])
         _flush(p)
-        summaries = env("mem_session_summary")
-        assert len(summaries) == 1
-        content = summaries[0]["arguments"]["content"]
-        assert content.startswith("## Goal") and "再发布一下" in content and "很长的工具输出" not in content
-        assert summaries[0]["arguments"]["session_id"] == "hermes-s1-renren-drama"
+        assert env("mem_session_summary") == []
+    finally:
+        p.shutdown()
+
+
+def test_pre_compress_resets_recall_without_archiving_excerpt(tmp_path, env):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看兼容测试", session_id="s1")
+        assert p.on_pre_compress([
+            {"role": "user", "content": "原始提问不是正式摘要"},
+            {"role": "assistant", "content": "原始回答不是正式摘要"},
+        ]) == ""
+        _flush(p)
+        assert env("mem_session_summary") == []
         again = p.prefetch("看看兼容测试", session_id="s1")
         assert "近期上下文-renren-drama" in again
     finally:
@@ -296,9 +915,9 @@ def test_compression_switch_keeps_engram_session(tmp_path, env):
     # Hermes 压缩会换 session_id（reset=False）：沿用同一个 Engram 会话，不关闭也不重开
     p = _make(tmp_path, rows={"s1": REPO, "s2": REPO})
     try:
-        p.prefetch("兼容测试", session_id="s1")
+        p.prefetch("请继续完整的兼容测试并说明结果", session_id="s1")
         p.on_session_switch("s2", parent_session_id="s1", reset=False, reason="compression")
-        p.sync_turn("继续兼容测试", "ok", session_id="s2")
+        p.sync_turn("请继续完整的兼容测试并说明结果", "ok", session_id="s2")
         _flush(p)
         assert env("mem_save_prompt")[-1]["arguments"]["session_id"] == "hermes-s1-renren-drama"
         assert len(env("mem_session_start")) == 1 and env("mem_session_end") == []
@@ -323,10 +942,10 @@ def test_already_ended_session_gets_suffix(tmp_path, env, monkeypatch):
     monkeypatch.setenv("FAKE_ENDED", "hermes-s1-renren-drama")
     p = _make(tmp_path)
     try:
-        p.prefetch("兼容测试", session_id="s1")
+        p.prefetch("请检查完整的兼容测试并说明结果", session_id="s1")
         ids = [s["arguments"]["id"] for s in env("mem_session_start")]
         assert ids[0] == "hermes-s1-renren-drama" and ids[-1].startswith("hermes-s1-renren-drama-r")
-        p.sync_turn("兼容测试", "ok", session_id="s1")
+        p.sync_turn("请检查完整的兼容测试并说明结果", "ok", session_id="s1")
         _flush(p)
         assert env("mem_save_prompt")[-1]["arguments"]["session_id"] == ids[-1]
     finally:

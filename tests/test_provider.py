@@ -199,7 +199,7 @@ def test_works_through_hermes_memory_manager(tmp_path):
     manager.add_provider(provider)
     manager.initialize_all(session_id="s1", hermes_home=str(home), platform="desktop")
     try:
-        out = manager.prefetch_all("看看兼容测试", session_id="s1")
+        out = manager.prefetch_all("请检查完整的兼容测试并说明结果", session_id="s1")
         assert "项目=renren-drama" in out
         line = manager.describe_recall()
         assert "Engram" in line and "recalled 2 memories" in line
@@ -207,7 +207,7 @@ def test_works_through_hermes_memory_manager(tmp_path):
         assert manager.has_tool("engram_save")
         saved = json.loads(manager.handle_tool_call("engram_save", {"title": "t", "content": "c"}))
         assert saved["id"] > 0
-        manager.sync_all("看看兼容测试", "回答", session_id="s1")
+        manager.sync_all("请检查完整的兼容测试并说明结果", "回答", session_id="s1")
         manager.on_session_end([])
     finally:
         manager.shutdown_all()

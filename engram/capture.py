@@ -1,9 +1,10 @@
-"""自动写入的纯函数部分：会话 id、压缩前总结、工具 schema。不依赖 Hermes。"""
+"""自动写入辅助：会话 id、脱敏、工具 schema，以及经核实的 Hermes 输入/摘要格式。"""
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 # 与 Engram 官方 Codex 插件 session-start 注入的协议同义，按 Hermes 工具名改写。
 MEMORY_PROTOCOL = (
@@ -20,6 +21,63 @@ MEMORY_PROTOCOL = (
 )
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_PRIVATE_RE = re.compile(r"<private>.*?</private>", re.IGNORECASE | re.DOTALL)
+
+
+def redact_private(value: Any) -> Any:
+    """递归替换显式 private 块；不是通用密钥扫描器。"""
+    if isinstance(value, str):
+        return _PRIVATE_RE.sub("[REDACTED]", value)
+    if isinstance(value, list):
+        return [redact_private(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_private(item) for key, item in value.items()}
+    return value
+
+
+def tool_result_texts(value: Any, *, _depth: int = 0, _text: bool = True) -> Iterator[str]:
+    """解开工具 JSON 包装，递归提取正文；不把状态/计数/目标等元数据当作正文。"""
+    if _depth >= 20:
+        return
+    if isinstance(value, str) and _text:
+        stripped = value.strip()
+        if stripped.startswith(("{", "[", '"')):
+            try:
+                decoded = json.loads(stripped)
+            except (ValueError, RecursionError):
+                pass
+            else:
+                yield from tool_result_texts(decoded, _depth=_depth + 1)
+                return
+        if stripped:
+            yield stripped
+    elif isinstance(value, dict):
+        fields = {"text", "content", "summary", "output", "stdout", "stderr", "result"}
+        for key, item in value.items():
+            if key in fields or isinstance(item, (dict, list)):
+                yield from tool_result_texts(item, _depth=_depth + 1, _text=key in fields)
+    elif isinstance(value, list):
+        for item in value:
+            yield from tool_result_texts(item, _depth=_depth + 1, _text=_text)
+
+# Hermes context_compressor 的内部用户行标记；OUT-OF-BAND 可能包含真人输入，不排除它。
+_SYNTHETIC_PREFIXES = (
+    "[System:", "[CONTEXT", "[PRIOR CONTEXT", "[IMPORTANT: Background",
+    "[Your active task list", "[Planning state preserved", "[ASYNC DELEGATION", "Cronjob Response:",
+)
+
+
+def is_synthetic_input(text: str) -> bool:
+    """只识别宿主已有的内部标记，不推断未提供的 extension/source 元数据。"""
+    if text.lstrip().startswith(_SYNTHETIC_PREFIXES):
+        return True
+    try:
+        from agent.context_compressor import (
+            COMPRESSION_CONTINUATION_USER_CONTENT, MAX_ITERATIONS_SUMMARY_REQUEST,
+        )
+        return text.strip() in (COMPRESSION_CONTINUATION_USER_CONTENT, MAX_ITERATIONS_SUMMARY_REQUEST)
+    except (ImportError, AttributeError):
+        return False
 
 
 def engram_session_id(hermes_session_id: str, project: str) -> str:
@@ -39,9 +97,31 @@ def _text_of(content: Any) -> str:
     return ""
 
 
+def extract_formal_summary(messages: List[Dict[str, Any]]) -> str:
+    """从宿主正式压缩 carrier 提取最新摘要，绝不合成对话摘录。"""
+    from agent.context_compressor import SUMMARY_PREFIX, HISTORICAL_TASK_HEADING, _SUMMARY_END_MARKER
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") not in ("assistant", "user", "system"):
+            continue
+        text = _text_of(msg.get("content"))
+        start = text.find(SUMMARY_PREFIX)
+        if start < 0 or (start > 0 and not msg.get("_compressed_summary")):
+            continue
+        if msg.get("role") == "user" and not msg.get("_compressed_summary"):
+            continue
+        end = text.find(_SUMMARY_END_MARKER, start + len(SUMMARY_PREFIX))
+        if end < 0:
+            continue
+        body = text[start + len(SUMMARY_PREFIX):end].strip()
+        if body.startswith(HISTORICAL_TASK_HEADING):
+            body = body[len(HISTORICAL_TASK_HEADING):].strip()
+        return redact_private(body)
+    return ""
+
+
 def build_compaction_summary(messages: List[Dict[str, Any]], *, max_chars: int = 6000,
                              item_chars: int = 400) -> str:
-    """压缩前把即将被丢掉的对话整理成 Engram 会话总结格式。
+    """旧版摘录辅助（provider 已不调用），保留用于兼容原有引用。
 
     只取用户与助手的文字（不含工具输出和系统消息），按时间顺序保留最近的部分，
     对应 Codex post-compaction 钩子要求的「把压缩摘要存进 mem_session_summary」。
@@ -50,7 +130,7 @@ def build_compaction_summary(messages: List[Dict[str, Any]], *, max_chars: int =
     answers: List[str] = []
     for msg in messages:
         role = msg.get("role") if isinstance(msg, dict) else None
-        text = " ".join(_text_of(msg.get("content")).split()) if role in ("user", "assistant") else ""
+        text = " ".join(redact_private(_text_of(msg.get("content"))).split()) if role in ("user", "assistant") else ""
         if not text or text.startswith("[CONTEXT COMPACTION"):
             continue
         clipped = text if len(text) <= item_chars else text[:item_chars] + "…"

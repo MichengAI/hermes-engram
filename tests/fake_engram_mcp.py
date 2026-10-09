@@ -63,17 +63,21 @@ def _handle_tool(state: State, name: str, args: dict) -> dict:
         state.started.add(args.get("id"))
         directory = str(args.get("directory") or "").replace("/", "\\").rstrip("\\").lower()
         project = os.environ.get("FAKE_SESSION_PROJECT") or _DIR_TO_PROJECT.get(directory, "dir-basename")
+        if project not in {p["name"] for p in PROJECTS}:
+            PROJECTS.append({"name": project, "directories": [args.get("directory")]})
         return _text({"project": project, "result": "started"})
     if name == "mem_session_end":
         state.ended.add(args.get("id"))
         return _text({"result": "completed"})
     if name in ("mem_save", "mem_session_summary"):
+        if name == "mem_session_summary" and os.environ.get("FAKE_SUMMARY_MODE") == "error":
+            return _error("summary_rejected")
         state.next_obs += 1
         return _text({"id": state.next_obs, "judgment_required": False, "project": args.get("project"), "result": "Memory saved"})
     if name == "mem_save_prompt":
         return _text({"result": "Prompt saved"})
     if name == "mem_capture_passive":
-        return _text({"result": "Passive capture complete: extracted=1 saved=1 duplicates=0"})
+        return _text({"result": "Fake transport acknowledgement; extraction is not simulated"})
     if name == "mem_get_observation":
         return _text({"id": args.get("id"), "content": "完整内容"})
     if name == "mem_judge":
@@ -102,6 +106,8 @@ def main() -> None:
                 with open(log_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps({"name": params.get("name"), "arguments": params.get("arguments")}, ensure_ascii=False) + "\n")
             if mode == "hang":
+                continue
+            if params.get("name") == "mem_session_summary" and os.environ.get("FAKE_SUMMARY_MODE") == "hang":
                 continue
             if mode == "crash":
                 sys.exit(3)

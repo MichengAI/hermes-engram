@@ -1,4 +1,4 @@
-"""Engram 记忆 provider：按项目自动召回 + 自动存取，对照 Engram 官方 Codex 插件的钩子时机。
+"""Engram 记忆 provider：按项目自动召回 + 自动存取，参考 Engram 官方 Codex / Pi 插件。
 
 安装位置 ``$HERMES_HOME/plugins/engram/``，启用方式 ``memory.provider: engram``。
 
@@ -8,7 +8,8 @@
 | UserPromptSubmit     | prefetch / sync_turn     | 关键词检索召回；mem_save_prompt 记录用户提问          |
 | （主动保存）         | engram_* 工具            | 带会话 id 和项目写入，模型按协议主动调用              |
 | SubagentStop         | on_delegation            | mem_capture_passive 被动捕获子代理结论                |
-| SessionStart:compact | on_pre_compress          | mem_session_summary 存档压缩前对话；下一轮重新召回    |
+| tool_execution_end   | post_tool_call           | mem_capture_passive 被动捕获非记忆工具结果           |
+| session_compact      | switch + sync_turn       | mem_session_summary 归档正式摘要；下一轮重新召回      |
 | SessionEnd           | on_session_end           | mem_session_end 关闭本会话注册过的 Engram 会话        |
 
 配置段 ``plugins.engram``（全部可选），见 README。
@@ -22,12 +23,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import queue
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -36,8 +39,8 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt, spawn_context_thread
 
-from .capture import (MEMORY_PROTOCOL, READ_TOOL_SCHEMAS, WRITE_TOOL_SCHEMAS, build_compaction_summary,
-                      engram_session_id)
+from .capture import (MEMORY_PROTOCOL, READ_TOOL_SCHEMAS, WRITE_TOOL_SCHEMAS, extract_formal_summary,
+                      engram_session_id, is_synthetic_input, redact_private, tool_result_texts)
 from .mcp_client import McpError, McpStdioClient, McpToolError
 from .recall import (choose_project, extract_query_tokens, format_search_results, limit_utf8, parse_tool_json,
                      path_key, resolve_project_from_dirs)
@@ -63,7 +66,10 @@ DEFAULTS: Dict[str, Any] = {
     "tools": True,  # 注册 engram_* 工具
     "auto_capture": True,  # 自动写入总开关：会话注册、提问记录、被动捕获、压缩存档、会话关闭、写工具
     "capture_prompts": True,
+    "prompt_min_chars": 10,  # 与 Pi 一致：超过此长度才记录
     "capture_delegation": True,
+    "capture_tools": True,
+    "auto_create_projects": True,  # 仅真实会话 cwd 中的 Git 仓库，复用 Engram canonical 注册
     "compaction_summary": True,
 }
 
@@ -91,10 +97,17 @@ class _SessionState:
     """单个 Hermes 会话的状态。"""
 
     sticky_project: Optional[str] = None  # 上次确定的项目，用于后续不点名的追问
+    confirmed_project: Optional[str] = None  # 本轮已确认归属；拒绝轮不得借用 sticky 写入
     context_done: Set[str] = field(default_factory=set)  # 已注入过近期上下文 / 协议的项目
     seen_ids: Set[int] = field(default_factory=set)  # 已注入过的 observation id
     engram_sessions: Dict[str, str] = field(default_factory=dict)  # 项目 → 已确认注册的 Engram 会话 id
     unbound: Set[str] = field(default_factory=set)  # 注册时目录解析到别的项目，不再重试
+    compaction_project: Optional[str] = None  # 压缩时项目，不能按后续提问猜归档目的地
+    summary_archives: Dict[str, str] = field(default_factory=dict)  # project:摘要哈希 → 状态
+    delegation_captures: Set[str] = field(default_factory=set)  # 项目 + 已入队正文哈希，不保留完整结果
+    prompt_sources: Dict[str, Optional[str]] = field(default_factory=dict)  # 正文哈希 → 来源项目；None 是永久拒绝/冲突
+    source_limit_reached: bool = False  # 无回合 ID，容量耗尽后不能淘汰旧拒绝记录再重新授权
+    recall_epoch: int = 0  # 陈旧 prefetch 不能发布新轮权限
 
 
 class EngramMemoryProvider(MemoryProvider):
@@ -115,6 +128,9 @@ class EngramMemoryProvider(MemoryProvider):
         self._last_status: Optional[RecallStatus] = None
         self._writes: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self._writer: Optional[threading.Thread] = None
+        self._tool_capture_hook_registered = False
+        self._delegation_sources: Dict[str, Optional[tuple[str, str]]] = {}
+        self._delegation_source_limit = False
 
     # ---- 基本信息 ----
 
@@ -177,6 +193,7 @@ class EngramMemoryProvider(MemoryProvider):
         self._join_writer(timeout=float(self._config["write_timeout"]))
         if self._client is not None:
             self._client.close()
+            self._client = None
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:
@@ -191,7 +208,14 @@ class EngramMemoryProvider(MemoryProvider):
                 state = _SessionState()
             else:
                 state = _SessionState(sticky_project=old.sticky_project,
+                                      confirmed_project=old.confirmed_project,
                                       engram_sessions=dict(old.engram_sessions), unbound=set(old.unbound))
+                state.prompt_sources = old.prompt_sources
+                state.source_limit_reached = old.source_limit_reached
+                state.compaction_project = old.compaction_project
+                state.summary_archives = old.summary_archives  # 后台任务与后代会话共享去重状态
+                if kwargs.get("reason") == "compression":
+                    state.compaction_project = old.confirmed_project
             self._sessions[new_session_id] = state
             self._session_id = new_session_id
 
@@ -223,12 +247,12 @@ class EngramMemoryProvider(MemoryProvider):
     def _call(self, tool: str, args: Dict[str, Any], deadline: float) -> Dict[str, Any]:
         """召回路径的调用：受单轮总预算约束。"""
         assert self._client is not None
-        return parse_tool_json(self._client.call_tool(tool, args, timeout=self._timeout(deadline)))
+        return parse_tool_json(self._client.call_tool(tool, redact_private(args), timeout=self._timeout(deadline)))
 
     def _call_write(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """后台写入 / 工具调用：用独立的写入超时。"""
         assert self._client is not None
-        return parse_tool_json(self._client.call_tool(tool, args, timeout=float(self._config["write_timeout"])))
+        return parse_tool_json(self._client.call_tool(tool, redact_private(args), timeout=float(self._config["write_timeout"])))
 
     def _get_catalog(self, deadline: float) -> List[Dict[str, Any]]:
         if self._catalog and time.monotonic() - self._catalog_at < _CATALOG_TTL_S:
@@ -341,34 +365,124 @@ class EngramMemoryProvider(MemoryProvider):
 
     # ---- 召回（SessionStart / UserPromptSubmit / 压缩后） ----
 
+    @staticmethod
+    def _prompt_key(text: str) -> str:
+        """只保留脱敏后正文哈希；不猜宿主可能采用的其它正文转换。"""
+        return hashlib.sha256(redact_private(text or "").strip().encode("utf-8")).hexdigest()
+
+    def _record_source(self, state: _SessionState, query: str, project: Optional[str]) -> None:
+        key = self._prompt_key(query)
+        with self._lock:
+            if state.source_limit_reached:
+                return
+            if key in state.prompt_sources:
+                if state.prompt_sources[key] != project:
+                    state.prompt_sources[key] = None
+            elif len(state.prompt_sources) >= 2048:
+                state.source_limit_reached = True
+            else:
+                state.prompt_sources[key] = project
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """先撤销当前权限；宿主跳过 prefetch 的轮次不得沿用上轮写权限。"""
+        with self._lock:
+            state = self._state(self._session_id)
+            state.confirmed_project = None
+            state.recall_epoch += 1
+            key = self._prompt_key(message)
+            if key in state.prompt_sources:
+                state.prompt_sources[key] = None  # 同文重复没有回合 ID，不能重新授权旧队列项
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         self._last_status = None
-        if not query or self._client is None or not self._platform_allowed():
-            return ""
         sid = session_id or self._session_id
-        deadline = time.monotonic() + float(self._config["total_budget"])
+        state = self._state(sid)
+        with self._lock:
+            state.confirmed_project = None
+            state.recall_epoch += 1
+            epoch = state.recall_epoch
+        project = None
         try:
-            return self._recall(query, sid, deadline)
+            if not query or self._client is None or not self._platform_allowed():
+                return ""
+            deadline = time.monotonic() + float(self._config["total_budget"])
+            project = self._resolve_project(redact_private(query), sid, deadline)
+            with self._lock:
+                if state.recall_epoch != epoch:
+                    project = None
+                    return ""
+                state.confirmed_project = project
+                if project:
+                    state.sticky_project = project
+            return self._recall(redact_private(query), sid, deadline, project=project)
         except McpError as exc:
             logger.info("Engram 召回已跳过：%s", exc)
-        except Exception as exc:  # 召回失败不能影响对话
+        except Exception as exc:
             logger.warning("Engram 召回异常已跳过：%s", type(exc).__name__)
+        finally:
+            self._record_source(state, query, project)
         return ""
+
+    def _bootstrap_project(self, sid: str, deadline: float) -> Optional[str]:
+        """首次登记仅针对会话明确指向的 Git 仓库，名称由 Engram 决定。"""
+        if not self._writes_allowed() or not _truthy(self._config.get("auto_create_projects")):
+            return None
+        directory = self._session_cwd(sid)  # 不拿后端进程目录或历史项目当初始化证据
+        if not directory or path_key(directory) in self._broad_dirs():
+            return None
+        try:
+            proc = subprocess.run(["git", "-C", directory, "rev-parse", "--show-toplevel"],
+                                  capture_output=True, timeout=min(2.0, self._timeout(deadline)), check=False)
+            root = proc.stdout.decode("utf-8", "strict").strip() if proc.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
+            return None
+        if not root or path_key(root) in self._broad_dirs():
+            return None
+        # 发现会话 ID 不猜项目名；注册应答才是 canonical 身份证据。
+        digest = hashlib.sha256(path_key(root).encode("utf-8")).hexdigest()[:16]
+        base = engram_session_id(sid, "discovery-" + digest)
+        result = None
+        candidate = base
+        for attempt in range(3):
+            candidate = base if attempt == 0 else f"{base}-r{int(time.time())}{attempt}"
+            try:
+                result = self._call("mem_session_start", {"id": candidate, "directory": root}, deadline)
+                break
+            except McpToolError as exc:
+                if exc.error_code != "session_already_ended":
+                    raise
+        if result is None:
+            return None
+        project = str(result.get("project") or "").strip()
+        if (not project or project.lower() == "unknown" or result.get("error_hint")
+                or any(ord(ch) < 32 or ch in "/\\\\" for ch in project)):
+            self._enqueue(self._end_job(candidate))
+            return None
+        with self._lock:
+            self._state(sid).engram_sessions[project] = candidate
+            self._catalog = []
+            self._catalog_at = 0
+        catalog = self._get_catalog(deadline)  # 重新读取服务端实际登记结果
+        if resolve_project_from_dirs(root, catalog, self._broad_dirs()) != project:
+            return None
+        return project
 
     def _resolve_project(self, query: str, sid: str, deadline: float) -> Optional[str]:
         catalog = self._get_catalog(deadline)
         state = self._state(sid)
         project, reason = choose_project(query, catalog, [self._session_cwd(sid), self._init_cwd],
                                          state.sticky_project, broad_dirs=self._broad_dirs())
+        if reason in ("no_project", "sticky") and not resolve_project_from_dirs(
+                self._session_cwd(sid), catalog, self._broad_dirs()):
+            discovered = self._bootstrap_project(sid, deadline)
+            if discovered:
+                project = discovered
         if not project:
             logger.debug("Engram 项目判定跳过：%s", reason)
             return None
-        with self._lock:
-            state.sticky_project = project
         return project
 
-    def _recall(self, query: str, sid: str, deadline: float) -> str:
-        project = self._resolve_project(query, sid, deadline)
+    def _recall(self, query: str, sid: str, deadline: float, *, project: Optional[str]) -> str:
         if not project:
             return ""
         state = self._state(sid)
@@ -428,13 +542,18 @@ class EngramMemoryProvider(MemoryProvider):
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: Optional[List[Dict[str, Any]]] = None,
                   turn_author: Optional[Dict[str, Any]] = None) -> None:
-        if not self._writes_allowed() or not _truthy(self._config.get("capture_prompts")):
-            return
-        text = (user_content or "").strip()
-        if not text or is_trivial_prompt(text):
-            return
         sid = session_id or self._session_id
-        project = self._state(sid).sticky_project
+        self._archive_formal_summary(sid, messages or [])
+        if (not self._writes_allowed() or not _truthy(self._config.get("capture_prompts"))
+                or (turn_author or {}).get("is_bot") is True):
+            return
+        text = redact_private(user_content or "").strip()
+        if (len(text) <= int(self._config["prompt_min_chars"]) or is_trivial_prompt(text)
+                or is_synthetic_input(text)):
+            return
+        with self._lock:
+            state = self._state(sid)
+            project = None if state.source_limit_reached else state.prompt_sources.get(self._prompt_key(text))
         if not project:
             return
 
@@ -448,25 +567,125 @@ class EngramMemoryProvider(MemoryProvider):
 
     # ---- SubagentStop：被动捕获子代理结论 ----
 
-    def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
-        if not self._writes_allowed() or not _truthy(self._config.get("capture_delegation")):
+    def on_post_tool_call(self, *, tool_name: str = "", result: Any = None,
+                          session_id: str = "", **kwargs) -> None:
+        """全局 observer 只接收本 provider 正在管理的会话，不能借父会话权限写子代理结果。"""
+        if (not self._writes_allowed() or not _truthy(self._config.get("capture_tools"))
+                or not session_id or session_id != self._session_id):
             return
-        content = (result or "").strip()
-        sid = self._session_id
-        project = self._state(sid).sticky_project
-        if not content or not project:
+        name = tool_name.lower()
+        leaf = name.rsplit("__", 1)[-1]
+        if not name or leaf == "memory" or leaf.startswith(("engram_", "mem_")) or "__engram__" in name:
             return
+        project = self._state(session_id).confirmed_project
+        if leaf == "delegate_task":
+            tasks = (kwargs.get("args") or {}).get("tasks") or []
+            with self._lock:
+                for task in tasks:
+                    if not isinstance(task, dict) or not task.get("goal"):
+                        continue
+                    key = self._prompt_key(str(task["goal"]))
+                    target = (session_id, project) if project else None
+                    if key in self._delegation_sources:
+                        if self._delegation_sources[key] != target:
+                            self._delegation_sources[key] = None
+                    elif len(self._delegation_sources) < 2048:
+                        self._delegation_sources[key] = target
+                    else:
+                        self._delegation_source_limit = True
+        if not project or result is None:
+            return
+        for text in tool_result_texts(result):
+            content = redact_private(text).strip()
+            if len(content) <= 50:
+                continue
+            if leaf == "delegate_task" and not self._claim_delegation(session_id, project, content):
+                continue
+            self._enqueue_capture(session_id, project, content, tool_name)
+
+    def _enqueue_capture(self, sid: str, project: str, content: str, source: str) -> None:
+        content = limit_utf8(content, 30000)  # 入队前脱敏正文已准备好，只持有有界文本
 
         def _job() -> None:
             engram_sid = self._ensure_engram_session(sid, project)
-            if not engram_sid:
-                return
-            self._call_write("mem_capture_passive", {"content": limit_utf8(content, 30000),
-                                                     "session_id": engram_sid, "source": "subagent-stop"})
-
+            if engram_sid:
+                self._call_write("mem_capture_passive", {"content": content,
+                                                         "session_id": engram_sid, "source": source})
         self._enqueue(_job)
 
+    def _claim_delegation(self, sid: str, project: str, content: str) -> bool:
+        key = project + ":" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+        with self._lock:
+            seen = self._state(sid).delegation_captures
+            if key in seen:
+                return False
+            seen.add(key)
+        return True
+
+    def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
+        if not self._writes_allowed() or not _truthy(self._config.get("capture_delegation")):
+            return
+
+        content = redact_private(result or "").strip()
+        sid = self._session_id
+        project = self._state(sid).confirmed_project
+        with self._lock:
+            key = self._prompt_key(task)
+            if self._delegation_source_limit:
+                return
+            if key in self._delegation_sources:
+                target = self._delegation_sources[key]
+                if target is None or target[0] != self._session_id:
+                    return  # /new 或来源冲突，不把旧任务挂到新会话
+                sid, project = target
+        if not content or not project:
+            return
+        if not self._claim_delegation(sid, project, content):
+            return
+
+        self._enqueue_capture(sid, project, content, "subagent-stop")
+
     # ---- 压缩：存档 + 下一轮重新召回 ----
+
+    def compaction_status(self, *, session_id: str = "") -> Dict[str, str]:
+        """归档状态快照，只含项目/哈希和状态，不含摘要正文。"""
+        with self._lock:
+            return dict(self._state(session_id or self._session_id).summary_archives)
+
+    def _archive_formal_summary(self, sid: str, messages: List[Dict[str, Any]]) -> None:
+        if not self._writes_allowed() or not _truthy(self._config.get("compaction_summary")):
+            return
+        state = self._state(sid)
+        project = state.compaction_project
+        if not project:
+            return
+        summary = extract_formal_summary(messages)
+        if not summary:
+            return
+        key = project + ":" + hashlib.sha256(summary.encode("utf-8")).hexdigest()
+        with self._lock:
+            if key in state.summary_archives:
+                return
+            state.summary_archives[key] = "pending"
+
+        def _job() -> None:
+            try:
+                engram_sid = self._ensure_engram_session(sid, project)
+                args: Dict[str, Any] = {"content": summary, "project": project}
+                if engram_sid:
+                    args["session_id"] = engram_sid
+                self._call_write("mem_session_summary", args)
+            except McpToolError:
+                with self._lock:
+                    state.summary_archives[key] = "failed"
+                raise
+            except Exception:
+                with self._lock:
+                    state.summary_archives[key] = "unknown"
+                raise
+            with self._lock:
+                state.summary_archives[key] = "saved"
+        self._enqueue(_job)
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         sid = self._session_id
@@ -474,18 +693,6 @@ class EngramMemoryProvider(MemoryProvider):
         with self._lock:
             state.context_done.clear()
             state.seen_ids.clear()
-            project = state.sticky_project
-        if project and self._writes_allowed() and _truthy(self._config.get("compaction_summary")):
-            summary = build_compaction_summary(messages or [])
-            if summary:
-                def _job() -> None:
-                    engram_sid = self._ensure_engram_session(sid, project)
-                    args: Dict[str, Any] = {"content": summary, "project": project}
-                    if engram_sid:
-                        args["session_id"] = engram_sid
-                    self._call_write("mem_session_summary", args)
-
-                self._enqueue(_job)
         return ""
 
     # ---- SessionEnd：关闭会话 ----
@@ -520,13 +727,13 @@ class EngramMemoryProvider(MemoryProvider):
             return _error_json(f"参数错误：{type(exc).__name__}")
 
     def _tool_project(self, args: Dict[str, Any]) -> Optional[str]:
-        """显式 project 必须是已知项目；省略时用本会话已确定的项目。"""
+        """显式 project 必须是已知项目；省略时只用本轮已确认项目，不借历史 sticky。"""
         explicit = str(args.get("project") or "").strip()
         if explicit:
             deadline = time.monotonic() + float(self._config["call_timeout"])
             names = {str(p.get("name")) for p in self._get_catalog(deadline)}
             return explicit if explicit in names else None
-        return self._state(self._session_id).sticky_project
+        return self._state(self._session_id).confirmed_project
 
     def _handle_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         if self._client is None:
@@ -575,4 +782,14 @@ class EngramMemoryProvider(MemoryProvider):
 
 def register(ctx) -> None:
     """Hermes 插件入口：注册 Engram memory provider。"""
-    ctx.register_memory_provider(EngramMemoryProvider())
+    provider = EngramMemoryProvider()
+    ctx.register_memory_provider(provider)
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        try:
+            register_hook("post_tool_call", provider.on_post_tool_call)
+            provider._tool_capture_hook_registered = True
+        except Exception as exc:
+            logger.warning("Engram 工具捕获 hook 不可用：%s", type(exc).__name__)
+    else:
+        logger.warning("Engram 工具捕获不可用：宿主 provider 加载器不支持 register_hook")
