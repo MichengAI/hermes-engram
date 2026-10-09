@@ -127,6 +127,8 @@ class McpStdioClient:
         """后台读取子进程 stdout，每行一个 JSON-RPC 消息。"""
         stream = proc.stdout
         try:
+            if stream is None:
+                return  # 未以 PIPE 启动时没有输出可读；finally 仍会投递 EOF
             for raw in iter(stream.readline, b""):
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -144,9 +146,12 @@ class McpStdioClient:
         if not self.alive:
             raise McpError("Engram 已退出")
         data = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+        stdin = self._proc.stdin if self._proc is not None else None
+        if stdin is None:
+            raise McpError("Engram 输入管道不可用")
         try:
-            self._proc.stdin.write(data)
-            self._proc.stdin.flush()
+            stdin.write(data)
+            stdin.flush()
         except OSError as exc:
             self._kill()
             raise McpError("写入 Engram 失败") from exc

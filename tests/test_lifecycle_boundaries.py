@@ -95,6 +95,49 @@ def test_session_id_unicode_and_truncation_do_not_collide():
     assert len(engram_session_id("s" * 300, "项目甲")) <= 120
 
 
+def _break_compressor(monkeypatch):
+    """模拟宿主重构或依赖缺失：压缩模块不可导入。"""
+    import sys
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", None)
+
+
+def test_formal_summary_degrades_when_host_markers_unavailable(monkeypatch):
+    from engram.capture import extract_formal_summary
+    _break_compressor(monkeypatch)
+    # 不合成摘要，也不猜测宿主标记：拿不到正式协议就当没有摘要。
+    assert extract_formal_summary([{"role": "assistant", "_compressed_summary": True, "content": "任意文本"}]) == ""
+
+
+def test_end_still_closes_when_summary_markers_unavailable(tmp_path, env, monkeypatch):
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看完整兼容测试")
+        p.on_session_switch("s1", reason="compression")
+        p._ensure_engram_session("s1", "renren-drama")
+        _break_compressor(monkeypatch)
+        p.on_session_end([{"role": "assistant", "_compressed_summary": True, "content": "x"}])
+        _flush(p)
+        assert p._state("s1").closing and p._state("s1").confirmed_project is None
+        assert env("mem_session_summary") == []
+        assert env("mem_session_end"), "摘要提取失败不能跳过会话关闭"
+    finally:
+        p.shutdown()
+
+
+def test_prompt_capture_survives_summary_marker_failure(tmp_path, env, monkeypatch):
+    p = _make(tmp_path)
+    query = "请检查完整的兼容测试并说明结果"
+    try:
+        p.prefetch(query)
+        p.on_session_switch("s1", reason="compression")
+        _break_compressor(monkeypatch)
+        p.sync_turn(query, "回答", messages=[{"role": "assistant", "_compressed_summary": True, "content": "x"}])
+        _flush(p)
+        assert len(env("mem_save_prompt")) == 1
+    finally:
+        p.shutdown()
+
+
 def test_exit_archives_available_formal_summary_before_end(tmp_path, env):
     p = _make(tmp_path)
     try:

@@ -215,5 +215,5 @@ uv run --no-project --python $py --with pytest python -m pytest -q
 - 被动捕获依赖 Engram 的 `## Key Learnings:` 提取规则：实测中文条目要用空格分词才会被提取，整句不带空格的中文会被忽略。记忆协议里已提示模型这样写。
 - Hermes memory provider 没有 `on_post_compress(summary=...)` 生命周期参数；`on_session_switch` 只通知 reason/id。归档由携带正式摘要的完成回合同步或会话结束触发；宿主不传 messages、没有正式标记或进程强制退出时仍可能漏归档；不承诺压缩前 durable checkpoint。
 - Hermes 未提供 Pi 的输入 `source="extension"` provenance；只能过滤已核实的内部标记/常量与机器人作者，未标记的扩展输入无法可靠识别，不能声称全部合成输入已跳过。
-- 当前摘要提取依赖宿主摘要常量和 carrier 标记格式；不支持未确认的旧格式或 provider-native opaque compaction。归档状态在压缩后的下一次召回中提示一次，不修改系统提示缓存。
+- 当前摘要提取依赖宿主摘要常量和 carrier 标记格式；不支持未确认的旧格式或 provider-native opaque compaction。宿主常量不可导入时跳过归档（不使用猜测的兜底标记），提问记录与会话关闭照常进行。归档状态在压缩后的下一次召回中提示一次，不修改系统提示缓存。
 - Hermes 先读取工具 schema 再初始化 provider，因此 `engram_*` 工具在 IM 渠道也会出现在工具列表里，但写工具调用会被拒绝。

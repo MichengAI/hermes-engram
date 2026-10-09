@@ -643,7 +643,10 @@ class EngramMemoryProvider(MemoryProvider):
                   messages: Optional[List[Dict[str, Any]]] = None,
                   turn_author: Optional[Dict[str, Any]] = None) -> None:
         sid = session_id or self._session_id
-        self._archive_formal_summary(sid, messages or [])
+        try:
+            self._archive_formal_summary(sid, messages or [])
+        except Exception as exc:  # 摘要归档失败不能连带丢掉本轮提问记录
+            logger.warning("Engram 摘要归档已跳过：%s", type(exc).__name__)
         if (not self._writes_allowed() or not _truthy(self._config.get("capture_prompts"))
                 or (turn_author or {}).get("is_bot") is True):
             return
@@ -810,7 +813,10 @@ class EngramMemoryProvider(MemoryProvider):
         with self._lock:
             if state.closing:
                 return
-            self._archive_formal_summary(sid, messages or [])
+            try:
+                self._archive_formal_summary(sid, messages or [])
+            except Exception as exc:  # 归档是附带动作，失败不能阻止撤权与关闭
+                logger.warning("Engram 退出归档已跳过：%s", type(exc).__name__)
             state.closing = True
             state.confirmed_project = None
             state.recall_epoch += 1
@@ -872,8 +878,8 @@ class EngramMemoryProvider(MemoryProvider):
         if tool_name == "engram_get":
             return json.dumps(self._call_write("mem_get_observation", {"id": int(args["id"])}), ensure_ascii=False)
         if tool_name == "engram_judge":
-            payload = {k: args[k] for k in ("judgment_id", "relation", "reason", "confidence") if k in args}
-            return json.dumps(self._call_write("mem_judge", payload), ensure_ascii=False)
+            judge_payload: Dict[str, Any] = {k: args[k] for k in ("judgment_id", "relation", "reason", "confidence") if k in args}
+            return json.dumps(self._call_write("mem_judge", judge_payload), ensure_ascii=False)
 
         project = self._tool_project(args)
         if not project:
@@ -890,19 +896,19 @@ class EngramMemoryProvider(MemoryProvider):
         if self._native is not None and not engram_sid:
             return _error_json("原生写入未确认会话身份")
         if tool_name == "engram_save":
-            payload: Dict[str, Any] = {"title": str(args.get("title") or ""), "content": str(args.get("content") or ""),
-                                       "type": str(args.get("type") or "manual"), "project": project}
+            save_payload: Dict[str, Any] = {"title": str(args.get("title") or ""), "content": str(args.get("content") or ""),
+                                            "type": str(args.get("type") or "manual"), "project": project}
             if args.get("topic_key"):
-                payload["topic_key"] = str(args["topic_key"])
+                save_payload["topic_key"] = str(args["topic_key"])
             if engram_sid:
-                payload["session_id"] = engram_sid
-                payload["capture_prompt"] = True
-            result = self._call_write("mem_save", payload)
+                save_payload["session_id"] = engram_sid
+                save_payload["capture_prompt"] = True
+            result = self._call_write("mem_save", save_payload)
         elif tool_name == "engram_session_summary":
-            payload = {"content": str(args.get("content") or ""), "project": project}
+            summary_payload: Dict[str, Any] = {"content": str(args.get("content") or ""), "project": project}
             if engram_sid:
-                payload["session_id"] = engram_sid
-            result = self._call_write("mem_session_summary", payload)
+                summary_payload["session_id"] = engram_sid
+            result = self._call_write("mem_session_summary", summary_payload)
         else:
             return _error_json(f"未知工具：{tool_name}")
         if not result.get("project"):

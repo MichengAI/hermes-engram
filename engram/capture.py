@@ -104,8 +104,15 @@ def _text_of(content: Any) -> str:
 
 
 def extract_formal_summary(messages: List[Dict[str, Any]]) -> str:
-    """从宿主正式压缩 carrier 提取最新摘要，绝不合成对话摘录。"""
-    from agent.context_compressor import SUMMARY_PREFIX, HISTORICAL_TASK_HEADING, _SUMMARY_END_MARKER
+    """从宿主正式压缩 carrier 提取最新摘要，绝不合成对话摘录。
+
+    标记常量只认宿主当前定义；宿主重构或依赖缺失时返回空，不用猜测的兜底标记，
+    以免误把普通文本当摘要归档。
+    """
+    try:
+        from agent.context_compressor import SUMMARY_PREFIX, HISTORICAL_TASK_HEADING, _SUMMARY_END_MARKER
+    except (ImportError, AttributeError):
+        return ""
     for msg in reversed(messages):
         if not isinstance(msg, dict) or msg.get("role") not in ("assistant", "user", "system"):
             continue
