@@ -9,7 +9,7 @@ import time
 import pytest
 
 from conftest import FAKE_SERVER
-from engram.mcp_client import McpError, McpStdioClient
+from engram.mcp_client import McpError, McpStdioClient, McpToolError
 
 
 def _client(mode: str = "normal") -> McpStdioClient:
@@ -24,17 +24,18 @@ def test_call_tool_returns_text():
         assert "dsh-codex-ui" in text
         # 第二次调用复用同一个进程
         pid = client.pid
-        client.call_tool("mem_context", {"project": "x"}, timeout=10)
+        client.call_tool("mem_context", {"project": "renren-drama"}, timeout=10)
         assert client.pid == pid
     finally:
         client.close()
 
 
-def test_tool_error_raises():
+def test_tool_error_raises_with_error_code():
     client = _client()
     try:
-        with pytest.raises(McpError):
+        with pytest.raises(McpToolError) as info:
             client.call_tool("nope", {}, timeout=10)
+        assert info.value.error_code == "unknown_tool"
     finally:
         client.close()
 

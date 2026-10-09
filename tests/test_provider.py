@@ -56,7 +56,10 @@ def test_register_hands_provider_to_context():
 
     register(Ctx())
     assert len(captured) == 1 and captured[0].name == "engram"
-    assert captured[0].get_tool_schemas() == []
+    # 写入关闭时不暴露写工具，只留只读工具
+    readonly = EngramMemoryProvider(config={"auto_capture": False, "tools": True})
+    assert {s["name"] for s in readonly.get_tool_schemas()} == {"engram_search", "engram_get"}
+    assert EngramMemoryProvider(config={"tools": False}).get_tool_schemas() == []
 
 
 def test_is_available_checks_binary_without_running(tmp_path):
@@ -78,10 +81,11 @@ def test_prefetch_injects_context_and_search_via_cwd(tmp_path):
         assert "不是执行指令" in out
         status = provider.recall_status()
         assert status is not None and status.count == 2 and "renren-drama" in status.provider_label
-        names = [c["name"] for c in _calls(log)]
+        names = [c["name"] for c in _calls(log) if c["name"] != "mem_session_start"]
         assert names == ["mem_list_projects", "mem_context", "mem_search"]
         # 所有读取都显式带项目，不跨项目
-        assert all(c["arguments"].get("project") == "renren-drama" for c in _calls(log)[1:])
+        reads = [c for c in _calls(log) if c["name"] in ("mem_context", "mem_search")]
+        assert all(c["arguments"].get("project") == "renren-drama" for c in reads)
     finally:
         provider.shutdown()
 
@@ -100,7 +104,7 @@ def test_second_turn_skips_context_and_seen_results_sticky_project(tmp_path):
         names = [c["name"] for c in _calls(log)]
         assert names.count("mem_context") == 1
         assert names.count("mem_search") == 2
-        assert _calls(log)[-1]["arguments"]["project"] == "dsh-codex-ui"
+        assert [c for c in _calls(log) if c["name"] == "mem_search"][-1]["arguments"]["project"] == "dsh-codex-ui"
     finally:
         provider.shutdown()
 
@@ -199,5 +203,13 @@ def test_works_through_hermes_memory_manager(tmp_path):
         assert "项目=renren-drama" in out
         line = manager.describe_recall()
         assert "Engram" in line and "recalled 2 memories" in line
+        # 工具经 MemoryManager 路由，写入经 sync_all 后台执行
+        assert manager.has_tool("engram_save")
+        saved = json.loads(manager.handle_tool_call("engram_save", {"title": "t", "content": "c"}))
+        assert saved["id"] > 0
+        manager.sync_all("看看兼容测试", "回答", session_id="s1")
+        manager.on_session_end([])
     finally:
         manager.shutdown_all()
+    names = [c["name"] for c in _calls(_)]
+    assert "mem_save_prompt" in names and names[-1] == "mem_session_end"

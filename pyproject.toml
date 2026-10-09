@@ -1,7 +1,7 @@
 [project]
 name = "hermes-engram"
-version = "0.1.0"
-description = "Hermes Agent 的 Engram 记忆 provider 插件（只读召回）"
+version = "0.2.0"
+description = "Hermes Agent 的 Engram 记忆 provider 插件（自动召回 + 自动存取）"
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]

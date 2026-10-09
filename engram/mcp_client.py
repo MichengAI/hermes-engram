@@ -20,6 +20,15 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("plugins.engram")
 
 _PROTOCOL_VERSION = "2024-11-05"
+
+
+def _error_code(text: str) -> str:
+    """从 Engram 错误文本里取 error_code；不是 JSON 时返回空串。"""
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return ""
+    return str(value.get("error_code") or "") if isinstance(value, dict) else ""
 _EOF = object()  # 读线程遇到子进程退出时投递的哨兵
 
 
@@ -28,6 +37,14 @@ class McpError(RuntimeError):
 
     消息里只放错误类别，不放记忆正文或用户输入。
     """
+
+
+class McpToolError(McpError):
+    """工具返回 isError：error_code 取自 Engram 的结构化错误（如 session_already_ended）。"""
+
+    def __init__(self, error_code: str = "") -> None:
+        super().__init__(f"工具返回错误：{error_code or 'unknown'}")
+        self.error_code = error_code
 
 
 class McpStdioClient:
@@ -72,10 +89,11 @@ class McpStdioClient:
             result = self._request("tools/call", {"name": name, "arguments": arguments}, deadline)
         if not isinstance(result, dict):
             raise McpError("响应格式异常")
-        if result.get("isError"):
-            raise McpError("工具返回错误")
         parts = [c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict) and c.get("type") == "text"]
-        return "\n".join(p for p in parts if p)
+        text = "\n".join(p for p in parts if p)
+        if result.get("isError"):
+            raise McpToolError(_error_code(text))
+        return text
 
     def close(self) -> None:
         with self._lock:
@@ -100,7 +118,7 @@ class McpStdioClient:
         reader.start()
         self._request("initialize", {
             "protocolVersion": _PROTOCOL_VERSION, "capabilities": {},
-            "clientInfo": {"name": "hermes-engram", "version": "0.1.0"},
+            "clientInfo": {"name": "hermes-engram", "version": "0.2.0"},
         }, deadline)
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 

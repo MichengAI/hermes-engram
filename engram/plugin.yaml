@@ -1,4 +1,4 @@
 name: engram
-version: 0.1.0
-description: "Engram 记忆 provider：按项目只读召回 Engram 记忆，带界面召回提示，IM 渠道默认不注入。"
+version: 0.2.0
+description: "Engram 记忆 provider：按项目自动召回 + 自动存取（会话、提问、被动捕获、压缩存档），带界面召回提示。"
 author: "YUJIYU"
