@@ -1,57 +1,57 @@
 <p align="center">
-  <img src="assets/branding/hermes-engram-banner.png" alt="Hermes Engram：项目记忆、可靠存取与会话恢复" width="100%">
+  <img src="assets/branding/hermes-engram-banner.png" alt="Hermes Engram — Project memory / 项目记忆" width="100%">
 </p>
 
 <div align="center">
 
 # Hermes Engram
 
-**让项目记忆，跟得上每一轮对话。**
+**Project memory that stays with you.**
 
 [![MIT](https://img.shields.io/badge/License-MIT-06b6d4.svg)](LICENSE)
 [![Hermes Agent Plugin](https://img.shields.io/badge/Hermes%20Agent-Memory%20Plugin-0f766e.svg)](https://github.com/NousResearch/hermes-agent)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab.svg?logo=python&logoColor=white)](pyproject.toml)
 [![Engram](https://img.shields.io/badge/Engram-Project%20Memory-8b5cf6.svg)](https://github.com/Gentleman-Programming/engram)
 
-[MIT 开源协议](LICENSE)
+**English** · [简体中文](README.zh-CN.md)
 
 </div>
 
-> 社区维护的 Hermes Agent 插件，不是 Hermes 或 Engram 官方产品。
+> A community-maintained Hermes Agent plugin. Not an official Hermes or Engram product.
 
-让 Hermes 记住项目里的决定、修复经验和工作进展。换一个会话继续做同一项目时，不必每次从头交代背景。
+Help Hermes remember project decisions, fixes, and progress. Pick up the same project in a new session without explaining everything again.
 
-[快速开始](#快速开始) · [日常使用](#日常使用) · [常见问题](#常见问题) · [开发文档](docs/00-交接入口/00-项目交接.md)
+[Quick start](#quick-start) · [Everyday use](#everyday-use) · [FAQ](#faq) · [Developer docs](docs/00-交接入口/00-项目交接.md)
 
-## 能做什么
+## What it does
 
-- **按项目记忆**：根据会话工作目录或你明确指定的项目，召回相关背景。
-- **保存重要结论**：提供记忆工具，让 Hermes 保存决定、经验和阶段总结；也会按规则自动记录提问和捕获工作结果。
-- **跨会话继续工作**：已有记忆保存在本机 Engram 中，新会话可以继续查询和使用。
-- **保留压缩后的背景**：符合归档条件时保存 Hermes 的正式会话摘要。
+- **Recall by project**: retrieve relevant background from your session's working directory or the project you explicitly name.
+- **Save useful conclusions**: give Hermes tools to save decisions, lessons, and session summaries; automatically record prompts and capture work results when they meet the capture rules.
+- **Continue across sessions**: keep memories in your local Engram store so new sessions can search and use them.
+- **Keep context after compaction**: archive Hermes' formal session summaries when the archive requirements are met.
 
-召回时，界面会显示类似提示：
+When memories are recalled, you will see a notice such as:
 
 ```text
 🧠 Engram·my-project — recalled 5 memories
 ```
 
-这里的数字是本轮召回条数，不是项目的记忆总数。你可以直接问 Hermes 查看具体内容。
+The number is the count recalled for this turn, not the project's total. Ask Hermes to show the memories if you want to read them.
 
-## 快速开始
+## Quick start
 
-### 1. 准备好 Hermes 和 Engram
+### 1. Have Hermes and Engram ready
 
-需要能在终端运行 `hermes`、`git` 和 `engram`。尚未安装时，先按官方说明安装：
+You need `hermes`, `git`, and `engram` available in your terminal. If they are not installed yet, follow the official guides:
 
-- [Hermes Agent 安装说明](https://hermes-agent.nousresearch.com/docs/getting-started/installation)
-- [Engram 安装说明](https://github.com/Gentleman-Programming/engram/blob/main/docs/INSTALLATION.md)
+- [Install Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/installation)
+- [Install Engram](https://github.com/Gentleman-Programming/engram/blob/main/docs/INSTALLATION.md)
 
-插件不需要额外的 Python 包，也不需要单独配置 MCP 或启动 Engram 服务。
+The plugin needs no additional Python packages. You do not need to configure a separate MCP server or start an Engram service yourself.
 
-### 2. 用官方插件命令安装
+### 2. Install with the official plugin command
 
-在 PowerShell 中运行：
+Run in PowerShell:
 
 ```powershell
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -61,13 +61,13 @@ hermes plugins install MichengAI/hermes-engram/engram --enable
 hermes memory status
 ```
 
-支持记忆插件自动选择的新版 Hermes 会把 Engram 设为当前记忆引擎。状态中应看到 `Provider: engram`，以及插件 `installed`、`available`。
+Recent Hermes versions that support automatic memory-provider selection will select Engram for you. The status should show `Provider: engram`, with the plugin `installed` and `available`.
 
-**`--enable` 表示你同意使用 Engram 替换当前外部记忆引擎。Hermes 同时只能使用一个外部记忆引擎，但内置的 MEMORY.md / USER.md 不会因此停用。**
+**`--enable` means you agree to replace your current external memory provider with Engram. Hermes can use one external provider at a time; its built-in MEMORY.md / USER.md memory remains enabled.**
 
-这是从社区 GitHub 仓库直接安装，不是官方目录中的已审查条目；安装器提示 `custom (unreviewed) source` 属于正常提醒。
+This installs directly from a community GitHub repository, not a reviewed entry in the official catalog. The installer's `custom (unreviewed) source` warning is expected.
 
-如果安装后仍不是 Engram，补执行：
+If Engram is not selected after installation, run:
 
 ```powershell
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -76,45 +76,45 @@ hermes config set memory.provider engram
 hermes memory status
 ```
 
-### 3. 重启 Hermes，打开项目会话
+### 3. Restart Hermes and open a project session
 
-重启正在使用的 Hermes 桌面端或终端，在你的项目目录开始对话。首次使用尚未登记的 Git 项目时，插件会在符合条件的本机会话中自动登记；已有 Engram 项目记忆可直接复用。
+Restart the Hermes desktop app or terminal session you use, then start a conversation in your project directory. An unregistered Git project can be registered automatically in an eligible local session. Existing Engram project memories can be reused.
 
-新项目还没有记忆时，不出现召回提示是正常的。可以先让 Hermes 记住一条项目结论，再开新会话查询。
+A new project with no memories may not show a recall notice. Ask Hermes to save a project decision first, then query it from a new session.
 
-## 日常使用
+## Everyday use
 
-像平时一样对话即可；重要结论也可以明确要求保存：
+Chat as usual, or explicitly ask Hermes to save something important:
 
-> 记住这个项目的决定：接口统一使用游标分页，不使用页码分页。
+> Remember this project's decision: use cursor pagination, not page-number pagination.
 
-> 当前项目有哪些记忆？
+> What memories do we have for the current project?
 
-> 查一下之前为什么这样设计登录流程。
+> Look up why we designed the login flow this way.
 
-> 把这次修复的原因和解决方法保存到当前项目。
+> Save the root cause and solution for this fix to the current project.
 
-> 总结这次工作，留给下次继续。
+> Summarize this work so we can continue next time.
 
-**自动捕获不等于完整聊天备份，也不保证每个结果都会成为记忆。** 关键决定建议明确要求保存并确认结果。
+**Automatic capture is not a full chat backup, and not every result becomes a memory.** For important decisions, explicitly request a save and confirm the result.
 
-## 隐私与使用边界
+## Privacy and boundaries
 
-- 默认服务本机桌面、CLI/TUI 和 ACP 等场景；IM、定时任务与子代理上下文默认不自动写入记忆。
-- 无法确认项目或出现多个候选项目时，跳过相应读写，不猜归属。
-- 记忆保存在本机 Engram 数据目录；插件启动的 Engram 子进程关闭自动云同步。
-- `<private>...</private>` 标记的内容会在保存前遮蔽。**这不是自动密钥扫描器，请勿把未标记的密码、密钥或个人敏感信息交给记忆保存。**
-- 召回的历史内容只是参考，不能替代你当前的指令。
+- Intended for local desktop, CLI/TUI, ACP, and similar sessions. Messaging channels, scheduled tasks, and subagent contexts do not automatically write memories by default.
+- If project ownership is unclear or ambiguous, the corresponding reads or writes are skipped rather than guessing.
+- Memories stay in your local Engram data directory. Engram subprocesses started by the plugin have automatic cloud sync disabled.
+- Content marked with `<private>...</private>` is redacted before saving. **This is not an automatic secret scanner. Do not save unmarked passwords, keys, or sensitive personal information.**
+- Recalled history is reference material, not a replacement for your current instructions.
 
-## 常见问题
+## FAQ
 
-### 插件装好了，为什么还没生效？
+### Installed, but not active?
 
-安装、选择记忆引擎和重启是三个环节。运行 `hermes memory status`，确认当前是 `engram` 且状态为 `available`，然后重启正在使用的 Hermes。
+Installation, provider selection, and restarting are separate steps. Run `hermes memory status`, confirm `engram` is the current provider and is `available`, then restart Hermes.
 
-### Engram 不在 PATH 中怎么办？
+### What if Engram is not on PATH?
 
-指定实际安装位置的绝对路径即可。以下是示例，请换成你自己的路径：
+Set the absolute path to your actual installation. Replace the example below with your own path:
 
 ```powershell
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -123,11 +123,11 @@ hermes config set plugins.engram.engram_path "C:\Tools\engram\engram.exe"
 hermes memory status
 ```
 
-修改后重启 Hermes。即使终端能找到 Engram，桌面端也可能还没继承新 PATH；显式设置路径可以解决这种情况。
+Restart Hermes afterward. Your desktop app may not have inherited a newly updated PATH even when your terminal can find Engram; an explicit path avoids that issue.
 
-### 可以只读取，不保存吗？
+### Can I use read-only mode?
 
-可以。以下设置会关闭自动保存和写入工具，保留召回、搜索与查看：
+Yes. This disables automatic saving and write tools while keeping recall, search, and viewing:
 
 ```powershell
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -135,11 +135,11 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 hermes config set plugins.engram.auto_capture false
 ```
 
-修改后重启 Hermes；恢复保存时把 `false` 改为 `true`。
+Restart Hermes after changing it. Set the value back to `true` to restore saving.
 
-### 如何更新？
+### How do I update?
 
-通过上述官方命令安装后，运行以下命令，再重启 Hermes：
+After installing with the official command above, run this and restart Hermes:
 
 ```powershell
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -147,11 +147,11 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 hermes plugins update engram
 ```
 
-旧版手动复制安装没有官方安装记录时，请参考[本地安装说明](docs/05-工程交付/00-开发与测试.md#本地安装)。
+Older manually copied installations may not have an official install record. See the [local installation notes](docs/05-工程交付/00-开发与测试.md#本地安装) (Chinese).
 
-### 如何切回原来的记忆引擎？
+### How do I switch back to my previous provider?
 
-把 `memory.provider` 改回原来的值，并重启 Hermes。例如，原来用 Holographic：
+Restore the previous value of `memory.provider` and restart Hermes. For example, if you used Holographic:
 
 ```powershell
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -159,17 +159,17 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 hermes config set memory.provider holographic
 ```
 
-切换不会删除已经保存的 Engram 记忆。
+Switching providers does not delete your saved Engram memories.
 
-## 更多说明
+## Further reading
 
-普通使用不需要调整高级选项。配置、安全机制和开发验证资料分别放在：
+You do not need advanced settings for everyday use. The detailed reference documents below are currently in Chinese:
 
-- [项目交接与文档导航](docs/00-交接入口/00-项目交接.md)
-- [记忆与安全机制](docs/03-技术架构/01-记忆与安全机制.md)
-- [完整配置参考](docs/03-技术架构/02-配置参考.md)
-- [开发与测试](docs/05-工程交付/00-开发与测试.md)
+- [Project handover and documentation index](docs/00-交接入口/00-项目交接.md)
+- [Memory and safety mechanisms](docs/03-技术架构/01-记忆与安全机制.md)
+- [Full configuration reference](docs/03-技术架构/02-配置参考.md)
+- [Development and testing](docs/05-工程交付/00-开发与测试.md)
 
-## 开源协议
+## License
 
-[MIT](LICENSE) · [问题反馈](https://github.com/MichengAI/hermes-engram/issues)
+[MIT](LICENSE) · [Report an issue](https://github.com/MichengAI/hermes-engram/issues)
