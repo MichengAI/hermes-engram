@@ -77,6 +77,63 @@ def test_command_must_be_argument_list():
     assert provider.is_available() is False
 
 
+def test_command_bare_name_ignores_current_directory(tmp_path, monkeypatch):
+    planted = tmp_path / "engram.exe"
+    planted.write_bytes(b"MZ")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "missing"))
+    provider = EngramMemoryProvider(config={"command": ["engram", "mcp"]})
+    assert provider._command() == []
+    assert provider.is_available() is False
+
+
+def test_command_bare_name_resolves_from_absolute_path(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    installed = bin_dir / ("engram.exe" if os.name == "nt" else "engram")
+    installed.write_bytes(b"MZ")
+    installed.chmod(0o755)
+    (tmp_path / installed.name).write_bytes(b"MZ")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    argv = EngramMemoryProvider(config={"command": ["engram", "mcp"]})._command()
+    assert Path(argv[0]).resolve() == installed.resolve()
+    assert argv[1:] == ["mcp"]
+
+
+def test_tilde_engram_path_is_expanded(tmp_path, monkeypatch):
+    installed = tmp_path / "engram.exe"
+    installed.write_bytes(b"MZ")
+    monkeypatch.setattr(os.path, "expanduser", lambda value: str(installed) if "~" in value else value)
+    provider = EngramMemoryProvider(config={"engram_path": "~/bin/engram.exe"})
+    assert Path(provider._binary()).resolve() == installed.resolve()
+    assert provider.is_available() is True
+
+
+def test_plugin_version_closes_manifest(monkeypatch):
+    import builtins
+    closed = []
+    real_open = builtins.open
+
+    class _Tracking:
+        def __init__(self, handle):
+            self._handle = handle
+        def read(self):
+            return self._handle.read()
+        def close(self):
+            closed.append(True)
+            return self._handle.close()
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.close()
+
+    monkeypatch.setattr(builtins, "open", lambda *args, **kwargs: _Tracking(real_open(*args, **kwargs)))
+    from engram.mcp_client import _plugin_version
+    assert _plugin_version()
+    assert closed, "plugin.yaml 读完后必须关闭"
+
+
 def test_client_version_comes_from_plugin_manifest():
     from engram.mcp_client import _plugin_version
     manifest = (Path(__file__).resolve().parents[1] / "engram" / "plugin.yaml").read_text(encoding="utf-8")

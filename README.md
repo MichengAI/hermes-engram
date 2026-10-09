@@ -34,7 +34,7 @@
 | `SessionStart` | 本会话第一次确定项目时（在 `prefetch()` 里） | `mem_session_start` 注册 Engram 会话；注入近期上下文（`mem_context`）和记忆协议 |
 | `UserPromptSubmit` | `prefetch()` + `sync_turn()` | 每轮关键词检索召回（`mem_search`）；回合结束后后台 `mem_save_prompt` 记录用户提问 |
 | （模型主动保存） | `engram_*` 工具 | `engram_save` / `engram_session_summary` / `engram_judge` / `engram_search` / `engram_get`，自动带会话 id 和项目 |
-| Pi `tool_execution_end` | 插件 observer `post_tool_call` | 非记忆工具结果先解析 JSON 字符串并递归提取文本字段；每段脱敏后超过 50 字符的真实多行正文交给 `mem_capture_passive` |
+| Pi `tool_execution_end` | 插件 observer `post_tool_call` | 非记忆工具结果先解析 JSON 字符串并递归提取文本字段；每段脱敏后超过 50 字符的正文交给 `mem_capture_passive`，不要求必须换行 |
 | `SubagentStop` | `on_delegation()` | 即使工具 hook 已注册也捕获异步完成结果；与同步 `delegate_task` 捕获按本会话、项目、脱敏正文哈希去重 |
 | Pi `session_compact` | `on_session_switch(reason="compression")` + 后续 `sync_turn(messages=...)` | 按压缩时项目归档 Hermes 正式摘要；`on_pre_compress()` 只重置召回，不再把对话摘录冒充正式摘要 |
 | `SessionEnd` | `on_session_end()` | `mem_session_end` 关闭本会话注册过的 Engram 会话 |
@@ -159,7 +159,7 @@ hermes config set memory.provider holographic
 | `compaction_summary` | `true` | 完成回合或结束时归档正式摘要，不是压缩前摘录 |
 | `native_http` | `false` | 自管回环服务，能力检查后启用恢复、卫星会话、保存结果查询 |
 | `persist_sessions` | `true` | 当前 profile 中持久化已确认会话身份，不保存正文 |
-| `command` | 无 | 高级/测试用：完整启动参数**列表**（如 `["D:/Tools/engram/engram.exe", "mcp"]`），优先于 `engram_path`；写成字符串会被拒绝 |
+| `command` | 无 | 高级/测试用：完整启动参数**列表**。第一项是绝对路径，或只在 PATH 绝对目录里解析的命令名；相对路径和当前目录同名程序会被拒绝。写成字符串也会被拒绝 |
 | `tools` | `true` | 注册 `engram_*` 工具并注入记忆协议 |
 | `max_bytes` | `6000` | 单轮注入总字节上限（UTF-8），含记忆协议 |
 | `context_bytes` | `3000` | 近期上下文字节上限 |
@@ -218,7 +218,7 @@ uv run --no-project --python $py --with pytest python -m pytest -q
 - 外部 memory provider 同一时间只能启用一个，启用 Engram 会停用 holographic。
 - 召回内容在聊天界面不显示正文，只显示召回提示；完整内容在发给模型的 `api_content` 里。
 - 被动捕获依赖 Engram 的 `## Key Learnings:` 提取规则：实测中文条目要用空格分词才会被提取，整句不带空格的中文会被忽略。记忆协议里已提示模型这样写。
-- Hermes memory provider 没有 `on_post_compress(summary=...)` 生命周期参数；`on_session_switch` 只通知 reason/id。归档由携带正式摘要的完成回合同步或会话结束触发；宿主不传 messages、没有正式标记或进程强制退出时仍可能漏归档；不承诺压缩前 durable checkpoint。
+- Hermes memory provider 没有 `on_post_compress(summary=...)` 生命周期参数；`on_session_switch` 会收到 `parent_session_id`、`reset`、`rewound` 和 `reason`。归档由携带正式摘要的完成回合同步或会话结束触发；宿主不传 messages、没有正式标记或进程强制退出时仍可能漏归档；不承诺压缩前 durable checkpoint。
 - Hermes 未提供 Pi 的输入 `source="extension"` provenance；只能过滤已核实的内部标记/常量与机器人作者，未标记的扩展输入无法可靠识别，不能声称全部合成输入已跳过。
 - 当前摘要提取依赖宿主摘要常量和 carrier 标记格式；不支持未确认的旧格式或 provider-native opaque compaction。宿主常量不可导入时跳过归档（不使用猜测的兜底标记），提问记录与会话关闭照常进行。归档状态在压缩后的下一次召回中提示一次，不修改系统提示缓存。
 - Hermes 先读取工具 schema 再初始化 provider，因此 `engram_*` 工具在 IM 渠道也会出现在工具列表里，但写工具调用会被拒绝。

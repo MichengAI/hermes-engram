@@ -28,7 +28,6 @@ import json
 import logging
 import os
 import queue
-import shutil
 import sqlite3
 import subprocess
 import threading
@@ -177,16 +176,25 @@ class EngramMemoryProvider(MemoryProvider):
         """显式路径必须是绝对路径；默认只在 PATH 的绝对目录里查找，不用当前目录。"""
         explicit = str(self._config.get("engram_path") or "").strip()
         if explicit:
-            return explicit if os.path.isabs(os.path.expanduser(explicit)) else ""
+            expanded = os.path.expanduser(explicit)
+            return os.path.abspath(expanded) if os.path.isabs(expanded) else ""
         return _system_executable("engram")
 
     def _command(self) -> List[str]:
         """自定义 command 必须是参数列表；字符串会被逐字符展开成 argv，直接拒绝。"""
         command = self._config.get("command")
         if command:
-            if isinstance(command, (list, tuple)) and command and all(isinstance(a, (str, os.PathLike)) for a in command):
-                return [str(a) for a in command]
-            return []
+            if not (isinstance(command, (list, tuple)) and command and all(isinstance(a, (str, os.PathLike)) for a in command)):
+                return []
+            argv = [str(a) for a in command]
+            head = os.path.expanduser(argv[0])
+            if os.path.isabs(head):
+                argv[0] = os.path.abspath(head)
+                return argv
+            resolved = _system_executable(Path(head).name)
+            if not resolved:
+                return []  # 裸命令名只认 PATH 绝对目录，不把当前目录的同名程序交给 CreateProcess
+            return [resolved, *argv[1:]]
         binary = self._binary()
         return [binary, "mcp", f"--tools={_TOOLS}"] if binary else []
 
@@ -460,12 +468,12 @@ class EngramMemoryProvider(MemoryProvider):
         """
         state = self._state(sid)
         with self._lock:
-            if state.closing:
-                return None
             if project in state.engram_sessions:
                 return state.engram_sessions[project]
             if explicit and project in state.satellite_sessions:
                 return state.satellite_sessions[project]
+            if state.closing:
+                return None
             if project in state.unbound and not (explicit and self._native is not None):
                 return None
         directory = self._session_cwd(sid) or self._init_cwd

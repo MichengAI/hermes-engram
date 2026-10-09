@@ -25,7 +25,8 @@ _PROTOCOL_VERSION = "2024-11-05"
 def _plugin_version() -> str:
     """从同目录 plugin.yaml 读取版本，避免在代码里第三处硬编码；读不到时返回 unknown。"""
     try:
-        text = open(os.path.join(os.path.dirname(__file__), "plugin.yaml"), encoding="utf-8").read()
+        with open(os.path.join(os.path.dirname(__file__), "plugin.yaml"), encoding="utf-8") as handle:
+            text = handle.read()
     except OSError:
         return "unknown"
     for line in text.splitlines():
