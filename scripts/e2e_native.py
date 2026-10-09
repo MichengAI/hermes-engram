@@ -102,8 +102,11 @@ def main() -> None:
         saved = json.loads(provider.handle_tool_call("engram_save", {
             "project": "native-b", "title": "Native satellite verification", "content": "Satellite evidence <private>NATIVE_SECRET</private>", "type": "decision"}))
         assert saved.get("id", 0) > 0 and saved["project"] == "native-b", saved
-        satellite = provider._state("native-s1").engram_sessions["native-b"]
-        assert satellite != before
+        satellite = provider._state("native-s1").satellite_sessions["native-b"]
+        assert satellite != before and "native-b" not in provider._state("native-s1").engram_sessions
+        for content in ("## Goal\nNative explicit summary one", "## Goal\nNative explicit summary two"):
+            out = json.loads(provider.handle_tool_call("engram_session_summary", {"content": content}))
+            assert out.get("id", 0) > 0, out
         provider.on_session_switch("native-s1", reason="compression")
         formal = {"role": "assistant", "_compressed_summary": True, "content":
             SUMMARY_PREFIX + "\n" + HISTORICAL_TASK_HEADING + "\nNative formal summary.\n" + _SUMMARY_END_MARKER}
@@ -130,6 +133,10 @@ def main() -> None:
             assert "NATIVE_SECRET" not in content and "[REDACTED]" in content
             assert project == "native-b" and sid == satellite
             assert conn.execute("SELECT COUNT(*) FROM observations WHERE type='session_summary' AND content='Native formal summary.'").fetchone()[0] == 1
+            explicit = conn.execute("SELECT topic_key FROM observations WHERE type='session_summary' AND content LIKE '%Native explicit summary%'").fetchall()
+            assert len(explicit) == 2 and all(row[0] in (None, "") for row in explicit), explicit  # 主动总结各自独立
+            archived = conn.execute("SELECT topic_key FROM observations WHERE content='Native formal summary.'").fetchone()[0]
+            assert archived == "session/compaction-recovery", archived
             assert conn.execute("SELECT COUNT(*) FROM user_prompts WHERE project='native-a'").fetchone()[0] >= 1
             assert conn.execute("SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL").fetchone()[0] == 0
         print(json.dumps({"core": health["version"], "satellite_project": project, "resumed": after != before,

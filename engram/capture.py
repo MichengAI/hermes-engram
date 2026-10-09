@@ -22,13 +22,46 @@ MEMORY_PROTOCOL = (
 )
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_PRIVATE_RE = re.compile(r"<private>.*?</private>", re.IGNORECASE | re.DOTALL)
+# 开/闭标签允许空白与大小写变体；标签本身按配对计数处理，见 _redact_text。
+_PRIVATE_TAG_RE = re.compile(r"<\s*(/?)\s*private\b[^>]*>", re.IGNORECASE)
+
+
+def _redact_text(text: str) -> str:
+    """配对替换 private 块；未闭合或嵌套时宁可多遮，不让秘密漏出。
+
+    官方 Pi 与 Engram 存储层只认严格的 ``<private>...</private>``；这里在其约定上
+    fail-closed：未闭合的开标签从开标签遮到结尾，嵌套按深度计数到最外层闭标签。
+    """
+    if "private" not in text.lower():
+        return text
+    out: List[str] = []
+    depth = 0
+    cursor = 0
+    for match in _PRIVATE_TAG_RE.finditer(text):
+        closing = bool(match.group(1))
+        if depth == 0:
+            if closing:
+                continue  # 孤立闭标签不含秘密，原样保留
+            out.append(text[cursor:match.start()])
+            depth = 1
+        elif closing:
+            depth -= 1
+            if depth == 0:
+                out.append("[REDACTED]")
+                cursor = match.end()
+        else:
+            depth += 1
+    if depth:
+        out.append("[REDACTED]")  # 未闭合：从开标签起全部遮掉
+        return "".join(out)
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 def redact_private(value: Any) -> Any:
     """递归替换显式 private 块；不是通用密钥扫描器。"""
     if isinstance(value, str):
-        return _PRIVATE_RE.sub("[REDACTED]", value)
+        return _redact_text(value)
     if isinstance(value, list):
         return [redact_private(item) for item in value]
     if isinstance(value, dict):
@@ -134,7 +167,7 @@ def extract_formal_summary(messages: List[Dict[str, Any]]) -> str:
 
 def build_compaction_summary(messages: List[Dict[str, Any]], *, max_chars: int = 6000,
                              item_chars: int = 400) -> str:
-    """旧版摘录辅助（provider 已不调用），保留用于兼容原有引用。
+    """已弃用：provider 不再调用，保留只为兼容外部引用；新代码请用 extract_formal_summary。
 
     只取用户与助手的文字（不含工具输出和系统消息），按时间顺序保留最近的部分，
     对应 Codex post-compaction 钩子要求的「把压缩摘要存进 mem_session_summary」。

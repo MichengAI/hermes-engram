@@ -48,7 +48,8 @@ Hermes 压缩边界只在 `reason="compression"` 时沿用 Engram 会话与摘�
 - 提问先去首尾空白和 `<private>...</private>` 块，再判断长度；默认 **超过 10 字符**且非 trivial 输入才记录，可配置 `prompt_min_chars`。长度是 Python 字符数，不是 UTF-8 字节数。
 - 跳过 Hermes 已知的系统、压缩、异步委派、cron 等内部标记，以及宿主的压缩续写/迭代上限总结提示；`turn_author.is_bot=true` 的提问也跳过。真人 OUT-OF-BAND 消息不因包装标记被丢弃。
 - 显式 private 块（不区分大小写、支持跨行）替换为 `[REDACTED]`。提问、工具结果、子代理结果在截断前脱敏；召回在关键词切分前脱敏；MCP 出站参数递归脱敏，覆盖主动保存及总结等路径。
-- 这是与 Pi 同义的**配对标签约定**，不是通用密钥/个人信息扫描器；不应把未加标签的秘密当作可安全存档的数据。
+- 在 Pi / Engram 严格约定之上**宁可多遮**：标签允许空白与换行（`<private >`、`</ private>`）；未闭合的开标签从开标签起遮到结尾；嵌套按深度配对到最外层闭标签；孤立闭标签原样保留。
+- 这是**配对标签约定**，不是通用密钥/个人信息扫描器；不应把未加标签的秘密当作可安全存档的数据。
 
 ### 已核实的宿主加载路径
 
@@ -76,6 +77,7 @@ Hermes 压缩边界只在 `reason="compression"` 时沿用 Engram 会话与摘�
 - **后台归属快照**：provider 收到任务后固定项目；后台委派从工具参数 `tasks[].goal` 记录派发时会话/项目，完成通知按该来源匹配。冲突、容量耗尽或 `/new` 后的旧任务不写；缺少派发证据的完成通知一律跳过。同步路径即使完成回调先于 observer 到达，工具最终正文仍会被捕获；不借当前项目补猜来源。正式摘要保留压缩时已确认的归属。
 - **首次项目登记**：`auto_create_projects=true` 时，未绑定目录只在真实会话 cwd 位于 Git 仓库、允许 primary/本机写入且没有未知/多项目点名时初始化。通过 `git rev-parse` 确认根目录，调用 `mem_session_start(id, directory)`，采用 Engram canonical 项目名并刷新目录绑定表核对。兼容本机 Engram 3.0.0，不依赖其不支持的 `mem_current_project(cwd)` 参数。普通目录、父目录子仓库扫描、用户主目录与后端进程 cwd 不触发首次登记；这是比官方普通目录名回退更严格的边界。Engram 可能在 `.git` 的共享元数据内创建私有项目身份文件，Git worktree 复用该身份。
 - **已有项目会话注册**：点名项目必须已有，且会话目录绑定与 Engram 注册应答一致才挂会话；不会根据任意未知文本创建项目。
+- **可执行文件解析**：`engram_path` 必须是绝对路径；留空时只在 `PATH` 的绝对目录里查找，跳过当前目录与相对目录（Windows 的 `shutil.which` 与 `CreateProcess` 都会优先查当前目录，而 Hermes 恢复会话会切到会话 cwd）。`git` 同样按此规则解析为绝对路径，`taskkill` 固定使用 `%SystemRoot%\System32`。找不到可信路径时插件不启用、不报错。
 - **没有确认归属的会话**：只读召回照常；`engram_save` 等工具改用显式 `project`、不挂会话；提问记录和被动捕获直接跳过（Engram 在缺会话时会按进程目录猜项目）。
 - **谁能写**：只在 primary 上下文和允许的平台写入。子代理、cron、IM 渠道不写；写工具在这些场景下直接返回错误。
 - **不阻塞对话**：写入都放进一个后台线程串行执行；召回有单轮总预算，超时就跳过。
@@ -108,7 +110,9 @@ hermes memory status
 `plugins.engram.native_http=true` 时，插件用指定 Engram 可执行文件启动**自己管理的回环 HTTP 子进程**（随机端口、同一数据目录、关闭云同步）；不连接任意远端 URL，不停止用户已有服务。默认值为 `false`，MCP-only 用户不受影响。
 
 - **恢复身份**：探测 `/health` 的 `root_session_resume`；支持时采用服务端确认的 continuation。旧核心使用经过确认的本地续会话，不冒充服务端恢复。
-- **卫星会话**：跨项目写入先检查 `isolated_session_registration`，注册 `project_owned` 隔离会话；缺少能力直接拒绝，不挂当前目录。
+- **卫星会话**：只服务模型显式指定 `project` 的写入工具（`engram_save` / `engram_session_summary`）。跨项目写入先检查 `isolated_session_registration`，注册 `project_owned` 隔离会话；缺少能力直接拒绝，不挂当前目录。提问记录、被动捕获、委派结果、压缩归档与 MCP 模式一致，只写目录绑定会话，不借卫星会话跨项目落库。
+- **总结元数据**：主动 `engram_session_summary` 每次独立保存（标题 `Session summary`）；只有压缩归档使用固定 `topic_key=session/compaction-recovery` 做覆盖更新，与官方 Pi 一致。
+- **子进程恢复**：原生服务退出后，下一次调用会重新拉起并重新校验实例身份，不会永久失效。
 - **保存结果确认**：写入前探测正式 `/observations/save-result` 协议，冻结一次 `operation_id` 与脱敏正文。响应丢失后只做只读查询，不重新 POST。结果不确定时返回 `outcome=unknown` 与操作 ID，使用 `engram_recover_save` 查询。
 - **压缩恢复**：下一轮在召回区输出一次归档状态；增强模式可读取 `/context/compaction`。历史上下文不是新指令，不修改系统提示缓存。
 
@@ -144,7 +148,7 @@ hermes config set memory.provider holographic
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `engram_path` | PATH 中的 `engram` | engram 可执行文件路径 |
+| `engram_path` | PATH 绝对目录中的 `engram` | engram 可执行文件**绝对路径**；相对路径会被拒绝 |
 | `platforms` | `[desktop, cli, tui, gui, local, acp]` | 允许召回和写入的平台；IM 渠道默认不在内 |
 | `auto_capture` | `true` | 自动写入总开关（会话注册、提问记录、被动捕获、压缩存档、会话关闭、写工具） |
 | `auto_create_projects` | `true` | 从真实会话 cwd 的未绑定 Git 仓库首次登记项目；项目名由 Engram 解析 |
@@ -155,6 +159,7 @@ hermes config set memory.provider holographic
 | `compaction_summary` | `true` | 完成回合或结束时归档正式摘要，不是压缩前摘录 |
 | `native_http` | `false` | 自管回环服务，能力检查后启用恢复、卫星会话、保存结果查询 |
 | `persist_sessions` | `true` | 当前 profile 中持久化已确认会话身份，不保存正文 |
+| `command` | 无 | 高级/测试用：完整启动参数**列表**（如 `["D:/Tools/engram/engram.exe", "mcp"]`），优先于 `engram_path`；写成字符串会被拒绝 |
 | `tools` | `true` | 注册 `engram_*` 工具并注入记忆协议 |
 | `max_bytes` | `6000` | 单轮注入总字节上限（UTF-8），含记忆协议 |
 | `context_bytes` | `3000` | 近期上下文字节上限 |
@@ -197,14 +202,14 @@ uv run --no-project --python $py --with pytest python -m pytest -q
 # 端到端·只读：Hermes 加载器 + 真实 Engram 库，只输出字节数、耗时和召回提示
 & $py scripts\e2e_smoke.py --engram D:\Tools\engram\engram.exe --cwd D:\Repository\deepseek-harness-plugin\dsh-codex-ui
 
-# 端到端·写入：在 Hermes scratch 下创建临时 HERMES_HOME / ENGRAM_DATA_DIR，结束后删除
-& $py scripts\e2e_smoke.py --engram D:\Tools\engram\engram.exe --cwd D:\Repository\hermes-plugins\hermes-engram --write
+# 端到端·写入：在 Hermes scratch 下创建临时 HERMES_HOME / ENGRAM_DATA_DIR / Git 仓库，结束后删除；--cwd 在写入模式下被忽略
+& $py scripts\e2e_smoke.py --engram D:\Tools\engram\engram.exe --cwd . --write
 
 # 原生增强：传入已核对、带保存结果查询端点的 Engram，不替换本机安装
 & $py scripts\e2e_native.py --engram D:\path\to\engram.exe
 ```
 
-`--write` 使用真实 Hermes provider 加载器、真实工具 observer 发射函数、真实委派 memory 通知函数及真实 `engram mcp`。夹具采用宿主真实 `delegate_task` 同步 JSON 包装和后台 dispatched/完成路径，最后只读回临时 SQLite，分别断言同步重复正文、仅工具 JSON 正文、后台完成正文各落库一次，并核实项目/会话归属、private 脱敏、提问过滤、正式摘要单次归档及会话关闭。摘要测试夹具采用宿主正式标记格式，**没有请求在线模型，不宣称验证了 LLM 生成质量或实际子代理调度**。pytest 覆盖真实加载器/MemoryManager 集成及明确拒绝、超时状态；假 MCP 只确认传输，不伪报 extracted/saved 数量，真实提取落库由隔离库 e2e 验证。
+`--write` 不会在任何真实仓库的 `.git` 里留下 Engram 私有身份文件（项目登记只发生在临时 Git 仓库）。它使用真实 Hermes provider 加载器、真实工具 observer 发射函数、真实委派 memory 通知函数及真实 `engram mcp`。夹具采用宿主真实 `delegate_task` 同步 JSON 包装和后台 dispatched/完成路径，最后只读回临时 SQLite，分别断言同步重复正文、仅工具 JSON 正文、后台完成正文各落库一次，并核实项目/会话归属、private 脱敏、提问过滤、正式摘要单次归档（且不带宿主压缩标记）及会话关闭。摘要测试夹具采用宿主正式标记格式，**没有请求在线模型，不宣称验证了 LLM 生成质量或实际子代理调度**。pytest 覆盖真实加载器/MemoryManager 集成及明确拒绝、超时状态；假 MCP 只确认传输，不伪报 extracted/saved 数量，真实提取落库由隔离库 e2e 验证。
 
 ## 已知限制
 

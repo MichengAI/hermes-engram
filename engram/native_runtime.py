@@ -60,6 +60,8 @@ class NativeRuntime:
         deadline = time.monotonic() + timeout
         with self._lock:
             if not self._test and self._proc is None:
+                # 先取空闲端口再交给子进程监听，中间有极短窗口。能在本机抢占端口的同用户进程
+                # 本就能直接读写 Engram 数据目录，不在威胁范围内；实例身份校验仍会拒绝换服务。
                 with socket.socket() as sock:
                     sock.bind(("127.0.0.1", 0))
                     port = sock.getsockname()[1]
@@ -72,6 +74,9 @@ class NativeRuntime:
                     raise McpError("原生 Engram 启动失败") from exc
             while True:
                 if self._proc is not None and self._proc.poll() is not None:
+                    # 子进程已退出：清掉记录，下次调用重新拉起并重新校验实例身份，不永久失效。
+                    self._proc = None
+                    self._instance = ""
                     raise McpError("原生 Engram 服务已退出")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -194,8 +199,14 @@ class NativeRuntime:
         if name == "mem_save":
             return self.save(args, timeout=timeout)
         if name == "mem_session_summary":
-            return self.save({**args, "title": "Compaction recovery summary", "type": "session_summary",
-                              "topic_key": "session/compaction-recovery", "capture_prompt": False}, timeout=timeout)
+            # 与官方 Pi 一致：主动总结各自独立；只有压缩归档使用固定 topic_key 做 upsert。
+            body = {"type": "session_summary", "scope": "project", "capture_prompt": False, **args}
+            if args.get("compaction"):
+                body.pop("compaction", None)
+                body.update(title="Compaction recovery summary", topic_key="session/compaction-recovery")
+            else:
+                body.setdefault("title", "Session summary")
+            return self.save(body, timeout=timeout)
         if name == "mem_save_prompt":
             return self.request("POST", "/prompts", args, timeout=timeout)
         if name == "mem_capture_passive":
@@ -211,8 +222,9 @@ class NativeRuntime:
             if proc is None:
                 return
             if proc.poll() is None:
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
+                taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+                if os.name == "nt" and os.path.isfile(taskkill):  # 绝对路径，不让当前目录的同名程序被执行
+                    subprocess.run([taskkill, "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
                 else:
                     proc.terminate()
                 try:

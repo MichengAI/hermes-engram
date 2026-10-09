@@ -409,10 +409,18 @@ def test_sync_turn_saves_prompt_in_background(tmp_path, env):
 def test_synthetic_prompt_is_not_saved(tmp_path, env, text):
     p = _make(tmp_path)
     try:
-        p.prefetch("看看兼容测试", session_id="s1")
+        # 先给合成正文补上来源证据：确保拒绝来自合成输入过滤，而不是来源缺失。
+        p.prefetch(text, session_id="s1")
+        p._state("s1").prompt_sources[p._prompt_key(text)] = "renren-drama"  # 绕过召回解析，只测过滤分支
         p.sync_turn(text, "回答", session_id="s1")
         _flush(p)
         assert env("mem_save_prompt") == []
+        # 对照：同样有来源证据的普通提问会被记录，证明拒绝来自合成输入过滤。
+        control = "请检查完整的兼容测试并说明结果"
+        p._state("s1").prompt_sources[p._prompt_key(control)] = "renren-drama"
+        p.sync_turn(control, "回答", session_id="s1")
+        _flush(p)
+        assert len(env("mem_save_prompt")) == 1
     finally:
         p.shutdown()
 
@@ -422,6 +430,7 @@ def test_host_plain_continuation_nudge_is_not_saved(tmp_path, env):
     p = _make(tmp_path)
     try:
         p.prefetch("看看兼容测试", session_id="s1")
+        p._state("s1").prompt_sources[p._prompt_key(COMPRESSION_CONTINUATION_USER_CONTENT)] = "renren-drama"
         p.sync_turn(COMPRESSION_CONTINUATION_USER_CONTENT, "回答")
         _flush(p)
         assert env("mem_save_prompt") == []
@@ -431,11 +440,17 @@ def test_host_plain_continuation_nudge_is_not_saved(tmp_path, env):
 
 def test_bot_authored_prompt_is_not_saved(tmp_path, env):
     p = _make(tmp_path)
+    text = "This is an automated bot follow-up about compatibility tests"
     try:
-        p.prefetch("看看兼容测试", session_id="s1")
-        p.sync_turn("This is an automated bot follow-up", "回答", turn_author={"id": "bot:alpha", "is_bot": True})
+        p.prefetch(text, session_id="s1")
+        p._state("s1").prompt_sources[p._prompt_key(text)] = "renren-drama"
+        p.sync_turn(text, "回答", turn_author={"id": "bot:alpha", "is_bot": True})
         _flush(p)
         assert env("mem_save_prompt") == []
+        # 对照：同一正文由真人发出时会被记录，证明拒绝来自 is_bot 判断。
+        p.sync_turn(text, "回答", turn_author={"id": "user:1", "is_bot": False})
+        _flush(p)
+        assert len(env("mem_save_prompt")) == 1
     finally:
         p.shutdown()
 
@@ -528,9 +543,11 @@ def test_save_without_project_returns_error_not_guess(tmp_path, env):
         # 显式传入已知项目就可以写
         ok = json.loads(p.handle_tool_call("engram_save", {"title": "t", "content": "c", "project": "renren-drama"}))
         assert ok["id"] > 0
-        # 未知项目被拒
+        # 未知项目被拒：必须由插件拦截，不能依赖假服务器替插件挡住（真实 Engram 可能按名字新建项目）。
+        before = len(env("mem_save"))
         bad = json.loads(p.handle_tool_call("engram_save", {"title": "t", "content": "c", "project": "foo"}))
         assert "error" in bad
+        assert len(env("mem_save")) == before, "未知项目的写入不应到达 Engram"
     finally:
         p.shutdown()
 
@@ -566,10 +583,55 @@ def test_tools_hidden_and_writes_disabled_for_subagent_and_cron(tmp_path, env):
 
 def test_im_platform_no_tools_effect_and_no_writes(tmp_path, env):
     p = _make(tmp_path, platform="weixin")
+    query = "请检查 renren-drama 的完整架构和测试结果"
     try:
-        p.sync_turn("renren-drama 架构", "回答", session_id="s1")
+        # IM 渠道连召回都不做；补上来源证据，确保拒绝来自平台门禁而不是来源缺失。
+        p._state("s1").prompt_sources[p._prompt_key(query)] = "renren-drama"
+        p._state("s1").confirmed_project = "renren-drama"
+        p.sync_turn(query, "回答", session_id="s1")
+        p.on_post_tool_call(tool_name="terminal", session_id="s1", result="## Key Learnings:\n1. " + "IM output. " * 10)
+        written = json.loads(p.handle_tool_call("engram_save", {"title": "t", "content": "c", "project": "renren-drama"}))
         _flush(p)
-        assert env() == []
+        assert "error" in written
+        assert not {c["name"] for c in env()} & {"mem_save", "mem_save_prompt", "mem_capture_passive", "mem_session_start"}
+    finally:
+        p.shutdown()
+
+
+def test_observer_ignores_other_session_ids(tmp_path, env):
+    """全局 post_tool_call 会收到子代理/其他会话的结果：只接收本 provider 当前会话。"""
+    # 子会话也在同一仓库目录：后续注册本可成功，确保拒绝只能来自 observer 的会话守卫。
+    p = _make(tmp_path, rows={"s1": REPO, "child-1": REPO})
+    body = "## Key Learnings:\n1. " + "Child session output must not borrow parent authority. " * 2
+    try:
+        p.prefetch("看看完整兼容测试")
+        # 即使该 ID 在本 provider 里有过确认项目（例如旧会话残留），也不能因为 observer 收到它就写入。
+        p._state("child-1").confirmed_project = "renren-drama"
+        p.on_post_tool_call(tool_name="terminal", session_id="child-1", result=body)
+        p.on_post_tool_call(tool_name="terminal", session_id="", result=body)
+        _flush(p)
+        assert env("mem_capture_passive") == []
+        p.on_post_tool_call(tool_name="terminal", session_id="s1", result=body)  # 对照：本会话照常捕获
+        _flush(p)
+        assert len(env("mem_capture_passive")) == 1
+    finally:
+        p.shutdown()
+
+
+def test_write_tools_rejected_after_session_end(tmp_path, env):
+    """结束后即使写入权限仍在（primary、允许平台），写工具也必须被 closing 守卫拒绝。"""
+    p = _make(tmp_path)
+    try:
+        p.prefetch("看看完整兼容测试")
+        p._ensure_engram_session("s1", "renren-drama")
+        p.on_session_end([])
+        _flush(p)
+        before = len(env("mem_save")) + len(env("mem_session_summary"))
+        saved = json.loads(p.handle_tool_call("engram_save", {"title": "t", "content": "c", "project": "renren-drama"}))
+        summary = json.loads(p.handle_tool_call("engram_session_summary", {"content": "x", "project": "renren-drama"}))
+        _flush(p)
+        assert "正在结束" in saved.get("error", "") and "正在结束" in summary.get("error", "")
+        assert len(env("mem_save")) + len(env("mem_session_summary")) == before
     finally:
         p.shutdown()
 

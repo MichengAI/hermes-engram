@@ -22,6 +22,19 @@ logger = logging.getLogger("plugins.engram")
 _PROTOCOL_VERSION = "2024-11-05"
 
 
+def _plugin_version() -> str:
+    """从同目录 plugin.yaml 读取版本，避免在代码里第三处硬编码；读不到时返回 unknown。"""
+    try:
+        text = open(os.path.join(os.path.dirname(__file__), "plugin.yaml"), encoding="utf-8").read()
+    except OSError:
+        return "unknown"
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() == "version" and value.strip():
+            return value.strip().strip("\"'")
+    return "unknown"
+
+
 def _error_code(text: str) -> str:
     """从 Engram 错误文本里取 error_code；不是 JSON 时返回空串。"""
     try:
@@ -118,7 +131,7 @@ class McpStdioClient:
         reader.start()
         self._request("initialize", {
             "protocolVersion": _PROTOCOL_VERSION, "capabilities": {},
-            "clientInfo": {"name": "hermes-engram", "version": "0.2.0"},
+            "clientInfo": {"name": "hermes-engram", "version": _plugin_version()},
         }, deadline)
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 

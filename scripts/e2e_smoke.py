@@ -2,11 +2,12 @@
 
 用法（需要 Hermes 的 venv Python）：
     python scripts/e2e_smoke.py --engram D:/Tools/engram/engram.exe --cwd D:/Repository/deepseek-harness-plugin/dsh-codex-ui
-    python scripts/e2e_smoke.py --engram D:/Tools/engram/engram.exe --cwd <仓库目录> --write
+    python scripts/e2e_smoke.py --engram D:/Tools/engram/engram.exe --cwd . --write
 
 - 默认只读：读真实 Engram 库，只输出字节数、耗时、召回提示和项目名，不打印记忆正文。
 - --write：完整走一遍自动存取（会话注册、提问记录、主动保存、被动捕获、压缩存档、会话关闭），
-  使用临时 ENGRAM_DATA_DIR，绝不写入真实库；结束后打印写入结果并删除临时库。
+  使用临时 ENGRAM_DATA_DIR 和临时 Git 仓库，不写真实库、也不在真实仓库 .git 里留下身份文件；
+  结束后打印写入结果并删除临时目录。
 不会修改真实的 HERMES_HOME。
 """
 
@@ -34,9 +35,8 @@ def _engram_json(engram: str, data_dir: str, *args: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engram", required=True, help="engram 可执行文件路径")
-    parser.add_argument("--cwd", required=True, help="模拟会话工作目录（应位于某个 git 仓库内）")
-    parser.add_argument("--unbound-cwd", default="D:\\AI\\HermesData", help="未绑定任何项目的目录")
-    parser.add_argument("--write", action="store_true", help="在临时 Engram 库里验证自动存取")
+    parser.add_argument("--cwd", required=True, help="只读模式：模拟会话工作目录（应位于某个 git 仓库内）；--write 时忽略，改用临时 Git 仓库")
+    parser.add_argument("--write", action="store_true", help="在临时 Engram 库与临时 Git 仓库里验证自动存取")
     parser.add_argument("--hermes-agent", default=str(Path(os.environ.get("LOCALAPPDATA", "")) / "hermes" / "hermes-agent"))
     args = parser.parse_args()
 
@@ -47,6 +47,11 @@ def main() -> int:
     try:
         if args.write:
             os.environ["ENGRAM_DATA_DIR"] = data_dir  # provider 子进程继承：只写临时库
+            # Engram 登记项目时会在仓库 .git 里写私有身份文件：写入模式绝不碰用户真实仓库。
+            sandbox = home / "e2e-repo"
+            sandbox.mkdir()
+            subprocess.run(["git", "init", "-q", str(sandbox)], check=True, capture_output=True)
+            args.cwd = str(sandbox)
         shutil.copytree(REPO / "engram", home / "plugins" / "engram", ignore=shutil.ignore_patterns("__pycache__"))
         (home / "config.yaml").write_text(
             "memory:\n  provider: engram\nplugins:\n  engram:\n"
@@ -54,7 +59,7 @@ def main() -> int:
             f"    auto_capture: {'true' if args.write else 'false'}\n", encoding="utf-8")
         db = sqlite3.connect(home / "state.db")
         db.execute("create table sessions (id text primary key, cwd text)")
-        db.executemany("insert into sessions values (?, ?)", [("e2e-1", args.cwd), ("e2e-2", args.unbound_cwd)])
+        db.executemany("insert into sessions values (?, ?)", [("e2e-1", args.cwd)])
         db.commit()
         db.close()
 
@@ -239,6 +244,9 @@ def _verify_isolated_db(data_dir: str, saved_id: int) -> None:
     assert any(row[0] == saved_id and "[REDACTED]" in row[2] for row in observations)
     summaries = [row for row in observations if "E2E formal compression summary" in row[2]]
     assert len(summaries) == 1 and "[REDACTED]" in summaries[0][2], summaries
+    from agent.context_compressor import SUMMARY_PREFIX, HISTORICAL_TASK_HEADING, _SUMMARY_END_MARKER
+    assert not any(marker.strip() in summaries[0][2] for marker in (SUMMARY_PREFIX, HISTORICAL_TASK_HEADING, _SUMMARY_END_MARKER)), \
+        "归档正文仍带宿主压缩标记"
     saved = next(row for row in observations if row[0] == saved_id)
     for marker in ("E2E synchronous wrapper capture", "E2E tool wrapper capture", "E2E asynchronous completion capture"):
         rows = [row for row in observations if marker in row[2]]

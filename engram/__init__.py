@@ -52,6 +52,7 @@ logger = logging.getLogger("plugins.engram")
 _TOOLS = ("mem_list_projects,mem_context,mem_search,mem_get_observation,mem_session_start,mem_session_end,"
           "mem_save,mem_save_prompt,mem_session_summary,mem_capture_passive,mem_judge")
 _CATALOG_TTL_S = 60.0
+_DELEGATION_SOURCE_LIMIT = 2048  # 每个会话的派发来源上限；满了只停该会话，不影响后续会话
 _WRITE_TOOLS = {"engram_save", "engram_session_summary", "engram_judge"}
 
 DEFAULTS: Dict[str, Any] = {
@@ -96,6 +97,28 @@ def _error_json(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
 
 
+def _system_executable(name: str) -> str:
+    """只在 PATH 的绝对目录里解析可执行文件，绝不使用当前目录。
+
+    Windows 的 shutil.which（3.11 即使传入 path 也会先插入当前目录）与 CreateProcess 都会优先
+    查找当前目录；Hermes 恢复会话时会切到会话 cwd，裸命令名会执行不可信仓库里的同名 exe。
+    """
+    if os.name == "nt":
+        extensions = [e for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+        candidates = [name] if any(name.lower().endswith(e.lower()) for e in extensions) else [name + e for e in extensions]
+    else:
+        candidates = [name]
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        directory = directory.strip().strip('"')
+        if not directory or not os.path.isabs(directory):
+            continue  # "."、相对目录都等价于当前目录，跳过
+        for candidate in candidates:
+            path = os.path.join(directory, candidate)
+            if os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK)):
+                return os.path.abspath(path)
+    return ""
+
+
 @dataclass
 class _SessionState:
     """单个 Hermes 会话的状态。"""
@@ -104,7 +127,8 @@ class _SessionState:
     confirmed_project: Optional[str] = None  # 本轮已确认归属；拒绝轮不得借用 sticky 写入
     context_done: Set[str] = field(default_factory=set)  # 已注入过近期上下文 / 协议的项目
     seen_ids: Set[int] = field(default_factory=set)  # 已注入过的 observation id
-    engram_sessions: Dict[str, str] = field(default_factory=dict)  # 项目 → 已确认注册的 Engram 会话 id
+    engram_sessions: Dict[str, str] = field(default_factory=dict)  # 项目 → 已确认注册的目录绑定 Engram 会话 id
+    satellite_sessions: Dict[str, str] = field(default_factory=dict)  # 原生隔离会话：只供显式写入工具，自动写入不可用
     unbound: Set[str] = field(default_factory=set)  # 注册时目录解析到别的项目，不再重试
     compaction_project: Optional[str] = None  # 压缩时项目，不能按后续提问猜归档目的地
     summary_archives: Dict[str, str] = field(default_factory=dict)  # project:摘要哈希 → 状态
@@ -137,9 +161,11 @@ class EngramMemoryProvider(MemoryProvider):
         self._last_status: Optional[RecallStatus] = None
         self._writes: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self._writer: Optional[threading.Thread] = None
+        self._writer_idle = False  # 写线程已决定空闲退出、尚未结束；入队时必须另起线程
         self._tool_capture_hook_registered = False
+        # 派发 goal 哈希 → (会话, 项目)；None 是冲突。按会话计数，会话结束/重置时清理。
         self._delegation_sources: Dict[str, Optional[tuple[str, str]]] = {}
-        self._delegation_source_limit = False
+        self._delegation_limited: Set[str] = set()  # 来源达到上限的会话：仅该会话停止委派捕获
 
     # ---- 基本信息 ----
 
@@ -148,18 +174,31 @@ class EngramMemoryProvider(MemoryProvider):
         return "engram"
 
     def _binary(self) -> str:
+        """显式路径必须是绝对路径；默认只在 PATH 的绝对目录里查找，不用当前目录。"""
         explicit = str(self._config.get("engram_path") or "").strip()
-        return explicit or shutil.which("engram") or ""
+        if explicit:
+            return explicit if os.path.isabs(os.path.expanduser(explicit)) else ""
+        return _system_executable("engram")
+
+    def _command(self) -> List[str]:
+        """自定义 command 必须是参数列表；字符串会被逐字符展开成 argv，直接拒绝。"""
+        command = self._config.get("command")
+        if command:
+            if isinstance(command, (list, tuple)) and command and all(isinstance(a, (str, os.PathLike)) for a in command):
+                return [str(a) for a in command]
+            return []
+        binary = self._binary()
+        return [binary, "mcp", f"--tools={_TOOLS}"] if binary else []
 
     def is_available(self) -> bool:
         """只检查可执行文件是否存在，不启动进程、不联网。"""
         if self._config.get("command"):
-            return True
+            return bool(self._command())
         binary = self._binary()
         return bool(binary) and Path(binary).is_file()
 
     def unavailable_reason(self) -> str:
-        return "未找到 engram 可执行文件：请把 engram 加入 PATH，或在 plugins.engram.engram_path 指定路径。"
+        return "未找到 engram 可执行文件：请把 engram 加入 PATH，或在 plugins.engram.engram_path 指定绝对路径。"
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [{"key": "engram_path", "description": "engram 可执行文件路径（留空则使用 PATH 中的 engram）", "default": ""}]
@@ -173,8 +212,11 @@ class EngramMemoryProvider(MemoryProvider):
         # 平台 / 子代理 / cron 的写入限制在 handle_tool_call 里兜底。
         if not _truthy(self._config.get("tools")):
             return []
-        schemas = [s for s in READ_TOOL_SCHEMAS if s["name"] != "engram_recover_save" or _truthy(self._config.get("native_http"))]
-        if _truthy(self._config.get("auto_capture")):
+        writes = _truthy(self._config.get("auto_capture"))
+        # 恢复工具只查询原生写入结果：只读模式不会创建原生运行时，列出来只会必然报错。
+        schemas = [s for s in READ_TOOL_SCHEMAS
+                   if s["name"] != "engram_recover_save" or (writes and _truthy(self._config.get("native_http")))]
+        if writes:
             schemas += WRITE_TOOL_SCHEMAS
         return schemas
 
@@ -193,18 +235,23 @@ class EngramMemoryProvider(MemoryProvider):
         self._platform = str(kwargs.get("platform") or "")
         self._agent_context = str(kwargs.get("agent_context") or "primary")
         self._init_cwd = str(kwargs.get("cwd") or "")
-        argv = self._config.get("command") or [self._binary(), "mcp", f"--tools={_TOOLS}"]
+        argv = self._command()
+        if not argv:
+            # 不抛异常：保持未初始化，召回与写入都自然跳过；原因由 unavailable_reason 说明。
+            logger.warning("Engram 未启用：未找到可信的可执行文件（engram_path 须为绝对路径，command 须为参数列表）")
+            return
         env = {**os.environ, "ENGRAM_CLOUD_AUTOSYNC": "0"}  # 只用本机库，不触发云同步
         env.pop("ENGRAM_PROJECT", None)  # 项目一律由插件显式传入，不吃进程级默认
-        self._client = McpStdioClient([str(a) for a in argv], env=env, cwd=self._hermes_home or None)
+        self._client = McpStdioClient(argv, env=env, cwd=self._hermes_home or None)
         if self._writes_allowed() and self._hermes_home and _truthy(self._config.get("persist_sessions")):
             data = str(Path(env.get("ENGRAM_DATA_DIR") or str(Path.home() / ".engram")).resolve())
             self._journal = SessionJournal(Path(self._hermes_home) / "plugins-state" / "engram.sqlite3", path_key(data))
         if self._writes_allowed() and _truthy(self._config.get("native_http")):
             binary = self._binary()
-            if not binary:
-                raise McpError("原生增强需要真实 engram 可执行文件路径")
-            self._native = NativeRuntime(binary, env=env, cwd=self._hermes_home or str(Path.home()))
+            if binary:
+                self._native = NativeRuntime(binary, env=env, cwd=self._hermes_home or str(Path.home()))
+            else:
+                logger.warning("Engram 原生增强未启用：需要可信的 engram 可执行文件路径")
 
     def shutdown(self) -> None:
         self._join_writer(timeout=float(self._config["write_timeout"]))
@@ -219,8 +266,11 @@ class EngramMemoryProvider(MemoryProvider):
                           rewound: bool = False, **kwargs) -> None:
         """会话切换。
 
-        - reset=True（/new 等）：全新状态；旧会话已由 Hermes 先调用 on_session_end 关闭。
-        - reset=False（压缩、/resume、/branch）：沿用项目和已注册的 Engram 会话，重新注入上下文。
+        - reset=True（/new 等）：全新状态；旧会话已由 Hermes 先调用 on_session_end 关闭，这里清掉其委派来源。
+        - reason="compression"：沿用已注册 Engram 会话、来源证据与摘要去重，下一轮输出压缩恢复提示。
+        - 同 ID 的非压缩切换：沿用已注册会话。
+        - 其它新 ID（/resume、/branch）：只沿用 sticky 项目，按新 ID 重新注册，不借父会话身份。
+        - rewound=True（/undo）：撤销旧来源证明与在途召回。
         """
         with self._lock:
             old = self._sessions.get(parent_session_id or self._session_id)
@@ -234,12 +284,19 @@ class EngramMemoryProvider(MemoryProvider):
                         self._delegation_sources[key] = None
             if reset or old is None:
                 state = _SessionState()
+                if reset and old is not None:
+                    old_sid = parent_session_id or self._session_id
+                    for key, target in list(self._delegation_sources.items()):
+                        if target is None or target[0] == old_sid:
+                            del self._delegation_sources[key]
+                    self._delegation_limited.discard(old_sid)
             else:
                 compression = kwargs.get("reason") == "compression"
                 same_id = new_session_id == (parent_session_id or self._session_id)
                 state = _SessionState(sticky_project=old.sticky_project)
                 if compression or (same_id and not old.closing):
                     state.engram_sessions = dict(old.engram_sessions)
+                    state.satellite_sessions = dict(old.satellite_sessions)
                     state.unbound = set(old.unbound)
                 if compression:
                     state.confirmed_project = old.confirmed_project
@@ -286,18 +343,30 @@ class EngramMemoryProvider(MemoryProvider):
             raise McpError("超过单轮预算")
         return min(float(self._config["call_timeout"]), remaining)
 
+    def _require_client(self) -> McpStdioClient:
+        """运行时守卫不用 assert：python -O 会把 assert 删掉。"""
+        if self._client is None:
+            raise McpError("Engram 未初始化")
+        return self._client
+
     def _call(self, tool: str, args: Dict[str, Any], deadline: float) -> Dict[str, Any]:
         """召回路径的调用：受单轮总预算约束。"""
-        assert self._client is not None
-        return parse_tool_json(self._client.call_tool(tool, redact_private(args), timeout=self._timeout(deadline)))
+        client = self._require_client()
+        return parse_tool_json(client.call_tool(tool, redact_private(args), timeout=self._timeout(deadline)))
 
-    def _call_write(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """后台写入 / 工具调用：用独立的写入超时。"""
-        assert self._client is not None
+    def _call_write(self, tool: str, args: Dict[str, Any], *, compaction: bool = False) -> Dict[str, Any]:
+        """后台写入 / 工具调用：用独立的写入超时。
+
+        compaction 只影响原生路径的元数据（固定 topic_key 归档），不会作为参数发给 MCP。
+        """
+        client = self._require_client()
         timeout = float(self._config["write_timeout"])
         if self._native is not None and tool in {"mem_save", "mem_save_prompt", "mem_capture_passive", "mem_session_summary", "mem_session_end"}:
-            return self._native.tool(tool, redact_private(args), timeout=timeout)
-        return parse_tool_json(self._client.call_tool(tool, redact_private(args), timeout=timeout))
+            payload = redact_private(args)
+            if compaction:
+                payload["compaction"] = True
+            return self._native.tool(tool, payload, timeout=timeout)
+        return parse_tool_json(client.call_tool(tool, redact_private(args), timeout=timeout))
 
     def _get_catalog(self, deadline: float) -> List[Dict[str, Any]]:
         if self._catalog and time.monotonic() - self._catalog_at < _CATALOG_TTL_S:
@@ -335,7 +404,10 @@ class EngramMemoryProvider(MemoryProvider):
         """写入任务进单个后台线程串行执行：不阻塞对话，且保证会话注册先于写入。"""
         self._writes.put(job)
         with self._lock:
-            if self._writer is None or not self._writer.is_alive():
+            # 写线程可能已从 get 超时、正准备退出（_writer_idle），此时 is_alive 仍为真；
+            # 必须另起线程，否则任务会滞留到下一次入队。
+            if self._writer is None or not self._writer.is_alive() or self._writer_idle:
+                self._writer_idle = False
                 self._writer = spawn_context_thread(self._writer_loop, name="engram-writer")
                 self._writer.start()
 
@@ -344,6 +416,12 @@ class EngramMemoryProvider(MemoryProvider):
             try:
                 job = self._writes.get(timeout=30)
             except queue.Empty:
+                with self._lock:
+                    if self._writer is not threading.current_thread():
+                        return  # 已有新写线程接手
+                    if not self._writes.empty():
+                        continue  # 退出前复查：空闲窗口内又有任务入队
+                    self._writer_idle = True
                 return  # 空闲退出，下次有写入再起
             try:
                 job()
@@ -354,20 +432,27 @@ class EngramMemoryProvider(MemoryProvider):
             finally:
                 self._writes.task_done()
 
-    def _join_writer(self, timeout: float = 10.0) -> None:
-        """等待已排队的写入完成（有上限，不无限阻塞）。"""
+    def _join_writer(self, timeout: float = 10.0) -> bool:
+        """等待已排队的写入完成（有上限，不无限阻塞）；返回队列是否已清空。"""
         end = time.monotonic() + timeout
         while self._writes.unfinished_tasks and time.monotonic() < end:
             time.sleep(0.02)
+        return not self._writes.unfinished_tasks
 
     # ---- 会话注册（SessionStart） ----
 
-    def _ensure_engram_session(self, sid: str, project: str, deadline: Optional[float] = None) -> Optional[str]:
-        """将注册串行化，结束清理必须等所有在途注册完成。"""
-        with self._registration_lock:
-            return self._register_engram_session(sid, project, deadline)
+    def _ensure_engram_session(self, sid: str, project: str, deadline: Optional[float] = None, *,
+                               explicit: bool = False) -> Optional[str]:
+        """将注册串行化，结束清理必须等所有在途注册完成。
 
-    def _register_engram_session(self, sid: str, project: str, deadline: Optional[float] = None) -> Optional[str]:
+        explicit=True 只用于模型显式指定项目的写入工具：原生模式下可注册隔离卫星会话。
+        自动写入（提问、被动捕获、委派、摘要）一律只接受目录绑定会话，与 MCP 模式边界一致。
+        """
+        with self._registration_lock:
+            return self._register_engram_session(sid, project, deadline, explicit=explicit)
+
+    def _register_engram_session(self, sid: str, project: str, deadline: Optional[float] = None, *,
+                                 explicit: bool = False) -> Optional[str]:
         """为（Hermes 会话, 项目）注册 Engram 会话，返回会话 id；不能确认归属时返回 None。
 
         Engram 按 directory 解析项目；只有解析结果与目标项目一致才算注册成功，
@@ -379,7 +464,9 @@ class EngramMemoryProvider(MemoryProvider):
                 return None
             if project in state.engram_sessions:
                 return state.engram_sessions[project]
-            if project in state.unbound:
+            if explicit and project in state.satellite_sessions:
+                return state.satellite_sessions[project]
+            if project in state.unbound and not (explicit and self._native is not None):
                 return None
         directory = self._session_cwd(sid) or self._init_cwd
         if not directory:
@@ -392,6 +479,10 @@ class EngramMemoryProvider(MemoryProvider):
         except McpError:
             return None
         bound = resolve_project_from_dirs(directory, catalog, self._broad_dirs()) == project
+        if not bound and not (explicit and self._native is not None):
+            with self._lock:
+                state.unbound.add(project)  # 自动写入不得借隔离会话跨项目落库
+            return None
         previous = self._journal.get(sid, project) if self._journal else None
         base = previous[0] if previous else engram_session_id(sid, project)
         if self._native is not None:
@@ -411,14 +502,10 @@ class EngramMemoryProvider(MemoryProvider):
             else:
                 return None
             with self._lock:
-                state.engram_sessions[project] = effective
+                (state.engram_sessions if bound else state.satellite_sessions)[project] = effective
                 if self._journal:
                     self._journal.put(sid, project, root, effective)
                 return None if state.closing else effective
-        if not bound:
-            with self._lock:
-                state.unbound.add(project)
-            return None
         base = previous[1] if previous else base
         for attempt in range(3):
             candidate = base if attempt == 0 else f"{base}-r{int(time.time())}{attempt}"
@@ -516,7 +603,10 @@ class EngramMemoryProvider(MemoryProvider):
         if not directory or path_key(directory) in self._broad_dirs():
             return None
         try:
-            proc = subprocess.run(["git", "-C", directory, "rev-parse", "--show-toplevel"],
+            git = _system_executable("git")
+            if not git:
+                return None
+            proc = subprocess.run([git, "-C", directory, "rev-parse", "--show-toplevel"],
                                   capture_output=True, timeout=min(2.0, self._timeout(deadline)), check=False)
             root = proc.stdout.decode("utf-8", "strict").strip() if proc.returncode == 0 else ""
         except (OSError, subprocess.TimeoutExpired, UnicodeError):
@@ -695,10 +785,10 @@ class EngramMemoryProvider(MemoryProvider):
                     if key in self._delegation_sources:
                         if self._delegation_sources[key] != target:
                             self._delegation_sources[key] = None
-                    elif len(self._delegation_sources) < 2048:
+                    elif self._delegation_count(session_id) < _DELEGATION_SOURCE_LIMIT:
                         self._delegation_sources[key] = target
                     else:
-                        self._delegation_source_limit = True
+                        self._delegation_limited.add(session_id)
         if not project or result is None:
             return
         for text in tool_result_texts(result):
@@ -719,6 +809,19 @@ class EngramMemoryProvider(MemoryProvider):
                                                          "session_id": engram_sid, "source": source})
         self._enqueue(_job)
 
+    def _delegation_count(self, sid: str) -> int:
+        """调用方持有 self._lock。只统计本会话的派发来源。"""
+        return sum(1 for target in self._delegation_sources.values() if target and target[0] == sid)
+
+    def _drop_delegation_sources(self, sid: str) -> None:
+        """会话结束或 /new：清掉该会话的来源与上限标记，不让全局表只增不删。"""
+        with self._lock:
+            for key, target in list(self._delegation_sources.items()):
+                if target is None or target[0] == sid:
+                    # None 是冲突标记，无法知道归属；随任一会话结束一起清，只会让旧 goal 失去来源（少记，不误记）。
+                    del self._delegation_sources[key]
+            self._delegation_limited.discard(sid)
+
     def _claim_delegation(self, sid: str, project: str, content: str) -> bool:
         key = project + ":" + hashlib.sha256(content.encode("utf-8")).hexdigest()
         with self._lock:
@@ -737,7 +840,7 @@ class EngramMemoryProvider(MemoryProvider):
         project = self._state(sid).confirmed_project
         with self._lock:
             key = self._prompt_key(task)
-            if self._delegation_source_limit:
+            if sid in self._delegation_limited:
                 return
             target = self._delegation_sources.get(key)
             if target is None or target[0] != self._session_id:
@@ -782,7 +885,7 @@ class EngramMemoryProvider(MemoryProvider):
                 args: Dict[str, Any] = {"content": summary, "project": project}
                 if engram_sid:
                     args["session_id"] = engram_sid
-                self._call_write("mem_session_summary", args)
+                self._call_write("mem_session_summary", args, compaction=True)
             except McpToolError:
                 with self._lock:
                     state.summary_archives[key] = "failed"
@@ -820,16 +923,19 @@ class EngramMemoryProvider(MemoryProvider):
             state.closing = True
             state.confirmed_project = None
             state.recall_epoch += 1
+        self._drop_delegation_sources(sid)  # 结束后的旧派发完成通知不再有来源，只会少记
         def close_registered() -> None:
             # 后台队列先完成已接纳的摘要，屏障再等待前台注册。
             with self._registration_lock:
                 with self._lock:
-                    ids = list(dict.fromkeys(state.engram_sessions.values()))
+                    ids = list(dict.fromkeys([*state.engram_sessions.values(), *state.satellite_sessions.values()]))
                 for engram_sid in ids:
                     self._end_job(engram_sid)()
                     with self._lock:
                         state.engram_sessions = {p: value for p, value in state.engram_sessions.items()
                                                  if value != engram_sid}
+                        state.satellite_sessions = {p: value for p, value in state.satellite_sessions.items()
+                                                    if value != engram_sid}
                 with self._lock:
                     state.context_done.clear()
         self._enqueue(close_registered)
@@ -892,7 +998,7 @@ class EngramMemoryProvider(MemoryProvider):
                                                      "match_mode": "any"})
             return json.dumps(result, ensure_ascii=False)
 
-        engram_sid = self._ensure_engram_session(self._session_id, project)
+        engram_sid = self._ensure_engram_session(self._session_id, project, explicit=True)
         if self._native is not None and not engram_sid:
             return _error_json("原生写入未确认会话身份")
         if tool_name == "engram_save":

@@ -32,13 +32,26 @@ def main() -> int:
     args = parser.parse_args()
 
     target = args.hermes_home / "plugins" / "engram"
+    # 先完整复制到暂存目录，成功后再替换：复制失败时旧版本原样保留，不会出现插件目录缺失。
+    staging = target.with_name(".engram.installing")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        shutil.copytree(REPO / "engram", staging, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    backup = target.with_name(".engram.bak")  # 以 . 开头：Hermes 发现逻辑会跳过，避免备份被当成另一个 provider
     if target.exists():
-        # 以 . 开头：Hermes 发现逻辑会跳过，避免备份被当成另一个 provider
-        backup = target.with_name(".engram.bak")
         shutil.rmtree(backup, ignore_errors=True)
         target.rename(backup)
         print(f"已备份旧版本到 {backup}")
-    shutil.copytree(REPO / "engram", target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    try:
+        staging.rename(target)
+    except OSError:
+        if backup.exists() and not target.exists():
+            backup.rename(target)  # 回滚：恢复旧版本
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     print(f"已安装到 {target}")
     return 0
 
